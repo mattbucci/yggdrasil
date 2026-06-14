@@ -9,6 +9,24 @@ and the legacy `ygg run` loop were removed. Task dupe-detection now uses
 token-set (Jaccard) string similarity instead of embeddings.
 **Date:** 2026-04-18 (decision); 2026-06-07 (implementation)
 
+> **Amendment 2026-06-14 — `ygg remember` re-added (without embeddings).**
+> The command is back, but as a *plain note store*, not the retrieval
+> corpus this ADR removed. A new `memories` table
+> (`migrations/20260614000001_add_memories.sql`) holds free-text notes
+> scoped to a repo (or global); there is **no embedding column, no
+> similarity search, no Ollama**. Retrieval is deterministic: recent
+> repo + global notes are listed newest-first in `ygg prime`
+> (SessionStart) and via `ygg remember --list`. This sidesteps every
+> failure mode the ADR documented — corpus poisoning requires a
+> retriever that feeds its own writes back into ranking, and there is no
+> ranking here. It restores the ergonomics of pinning a durable
+> directive (`ygg remember "..."`) that the four-phase removal took
+> away, while keeping the "agents communicate via tasks, not retrieved
+> prior turns" stance intact. The removed `ygg memory` /
+> CLAUDE.md-include path (Phase 2) is unchanged and remains the home for
+> instructions Claude Code itself should load every session; `remember`
+> is for shorter cross-session notes surfaced in the prime block.
+
 ## Context
 
 Yggdrasil started as two bets: (1) be the coordination layer for many

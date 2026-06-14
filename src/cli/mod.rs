@@ -14,6 +14,7 @@ pub mod msg_cmd;
 pub mod plan_cmd;
 pub mod prime;
 pub mod recover;
+pub mod remember_cmd;
 pub mod rollup_cmd;
 pub mod run_cmd;
 pub mod scheduler_cmd;

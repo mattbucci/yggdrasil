@@ -674,6 +674,35 @@ fn classify_close_reason(
     }
 }
 
+/// Reassign a task filed in the wrong repo to the right one, by destination
+/// task_prefix. The task keeps its UUID; its human ref is renumbered into the
+/// target repo (`yggdrasil-42` → `canairy-7`).
+pub async fn move_to(
+    pool: &sqlx::PgPool,
+    reference: &str,
+    target_prefix: &str,
+    agent_name: &str,
+) -> Result<(), anyhow::Error> {
+    let t = resolve_task(pool, reference).await?;
+    let target = RepoRepo::new(pool)
+        .get_by_prefix(target_prefix)
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no repo with prefix '{target_prefix}' — `ygg task list --all` shows known prefixes"
+            )
+        })?;
+    if target.repo_id == t.repo_id {
+        anyhow::bail!("{reference} is already in '{target_prefix}'");
+    }
+    let agent_id = resolve_agent_id(pool, agent_name).await?;
+    let new_seq = TaskRepo::new(pool)
+        .move_to_repo(t.task_id, target.repo_id, agent_id)
+        .await?;
+    println!("{reference} → {}-{new_seq}", target.task_prefix);
+    Ok(())
+}
+
 pub async fn add_dep(
     pool: &sqlx::PgPool,
     task_ref: &str,

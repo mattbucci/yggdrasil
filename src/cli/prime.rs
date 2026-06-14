@@ -4,6 +4,7 @@ use crate::{
     lock::LockManager,
     models::{
         agent::AgentRepo,
+        memory::{Memory, MemoryRepo},
         repo::{RepoRepo, detect_git_repo, slugify},
         task::{Task, TaskRepo},
     },
@@ -35,6 +36,7 @@ struct PrimeContext {
     repo_label: Option<String>,
     ready_tasks: Vec<Task>,
     open_count: i64,
+    notes: Vec<Memory>,
     pending_migrations: usize,
 }
 
@@ -76,8 +78,8 @@ async fn try_with_db(
     let transcript_tokens =
         transcript_path.and_then(|p| std::fs::metadata(p).ok().map(|m| (m.len() / 10) as i64));
 
-    // Best-effort: detect current repo, surface a few ready tasks.
-    let (repo_label, ready_tasks, open_count) = resolve_repo_context(&pool).await;
+    // Best-effort: detect current repo, surface a few ready tasks + recent notes.
+    let (repo_label, ready_tasks, open_count, notes) = resolve_repo_context(&pool).await;
 
     let pending_migrations = db::pending_migrations(&pool)
         .await
@@ -94,13 +96,23 @@ async fn try_with_db(
         repo_label,
         ready_tasks,
         open_count,
+        notes,
         pending_migrations,
     })
 }
 
-async fn resolve_repo_context(pool: &sqlx::PgPool) -> (Option<String>, Vec<Task>, i64) {
+async fn resolve_repo_context(
+    pool: &sqlx::PgPool,
+) -> (Option<String>, Vec<Task>, i64, Vec<Memory>) {
+    // Recent global notes show even outside a known repo.
+    let global_notes = || async {
+        MemoryRepo::new(pool)
+            .list(None, false, 5)
+            .await
+            .unwrap_or_default()
+    };
     let Ok(cwd) = std::env::current_dir() else {
-        return (None, vec![], 0);
+        return (None, vec![], 0, global_notes().await);
     };
     let repo_repo = RepoRepo::new(pool);
 
@@ -121,16 +133,21 @@ async fn resolve_repo_context(pool: &sqlx::PgPool) -> (Option<String>, Vec<Task>
     };
 
     let Some(repo) = repo_opt else {
-        return (None, vec![], 0);
+        return (None, vec![], 0, global_notes().await);
     };
     let task_repo = TaskRepo::new(pool);
     let ready = task_repo.ready(repo.repo_id).await.unwrap_or_default();
     let stats = task_repo.stats(Some(repo.repo_id)).await.ok();
     let open_count = stats.map(|s| s.open + s.in_progress).unwrap_or(0);
+    let notes = MemoryRepo::new(pool)
+        .list(Some(repo.repo_id), false, 5)
+        .await
+        .unwrap_or_default();
     (
         Some(format!("{} ({})", repo.name, repo.task_prefix)),
         ready,
         open_count,
+        notes,
     )
 }
 
@@ -225,6 +242,19 @@ fn print_rich(agent_name: &str, ctx: &PrimeContext) {
         }
     }
 
+    if !ctx.notes.is_empty() {
+        println!();
+        println!("**notes** (`ygg remember`)");
+        for n in &ctx.notes {
+            let scope = if n.repo_id.is_none() {
+                " · global"
+            } else {
+                ""
+            };
+            println!("  - {}{scope}", note_snippet(&n.text));
+        }
+    }
+
     println!();
     println!("### When to use `ygg`");
     println!();
@@ -265,6 +295,16 @@ fn print_degraded(agent_name: &str, err: &anyhow::Error) {
         "Once the DB is reachable, `ygg prime` emits agent-coordination rules — for now, \
         coordinate via `ygg lock acquire/release`, `ygg spawn`, `ygg status`. Do not use `bd` / beads."
     );
+}
+
+/// One-line note preview for the prime block — collapse newlines, cap length.
+fn note_snippet(text: &str) -> String {
+    let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() <= 120 {
+        one_line
+    } else {
+        one_line.chars().take(120).collect::<String>() + "…"
+    }
 }
 
 fn pressure_bar(pct: u64) -> &'static str {

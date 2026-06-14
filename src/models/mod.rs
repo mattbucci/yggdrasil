@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod event;
 pub mod learning;
+pub mod memory;
 pub mod repo;
 pub mod session;
 pub mod task;

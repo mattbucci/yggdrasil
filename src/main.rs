@@ -299,6 +299,32 @@ enum Commands {
         action: LearnAction,
     },
 
+    /// Persist a durable note for future sessions. Re-added post-ADR-0015 as a
+    /// plain note store — no embeddings, no similarity. Scoped to the current
+    /// repo unless --global. Recent notes surface in `ygg prime` (SessionStart)
+    /// and `ygg remember --list`.
+    Remember {
+        /// The note text (omit when using --list).
+        #[arg(default_value = "", allow_hyphen_values = true)]
+        text: String,
+        /// List stored notes instead of writing one.
+        #[arg(long)]
+        list: bool,
+        /// Store (or, with --list, read) at global scope across every repo.
+        #[arg(long)]
+        global: bool,
+        /// With --list: include every repo's notes, not just this one + global.
+        #[arg(long)]
+        all: bool,
+        /// With --list: max notes to show.
+        #[arg(long, default_value_t = 20)]
+        limit: i64,
+        #[arg(short, long)]
+        agent: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Record that the agent is about to invoke a tool — PreToolUse hook.
     AgentTool {
         /// Tool name (Bash, Edit, Read, …)
@@ -847,6 +873,17 @@ enum TaskAction {
         /// Emit cycles as a JSON array of task-ref arrays.
         #[arg(long)]
         json: bool,
+    },
+    /// Reassign a task to another repo by its task_prefix — for work filed in
+    /// the wrong repo. Keeps the task_id; renumbers the human ref into the
+    /// destination (e.g. `yggdrasil-42` → `canairy-7`).
+    Move {
+        /// Task ref (UUID, ygg-<shortuuid>, or <prefix>-<seq>)
+        reference: String,
+        /// Destination repo's task_prefix (e.g. `canairy`)
+        repo: String,
+        #[arg(short, long)]
+        agent: Option<String>,
     },
     /// Move a task to the trash. Hidden from list/ready/blocked/dupes
     /// until restored or hard-deleted by `ygg task purge`.
@@ -1606,6 +1643,14 @@ async fn main() -> anyhow::Result<()> {
                 TaskAction::Lint { all, json } => {
                     ygg::cli::task_cmd::lint(&pool, all, json).await?;
                 }
+                TaskAction::Move {
+                    reference,
+                    repo,
+                    agent,
+                } => {
+                    let agent_name = agent.unwrap_or_else(default_agent);
+                    ygg::cli::task_cmd::move_to(&pool, &reference, &repo, &agent_name).await?;
+                }
                 TaskAction::Delete { reference } => {
                     ygg::cli::task_cmd::delete(&pool, &reference).await?;
                 }
@@ -2003,6 +2048,31 @@ async fn main() -> anyhow::Result<()> {
                         .map_err(|_| anyhow::anyhow!("invalid uuid: {id}"))?;
                     ygg::cli::learning_cmd::delete(&pool, uuid).await?;
                 }
+            }
+        }
+        Commands::Remember {
+            text,
+            list,
+            global,
+            all,
+            limit,
+            agent,
+            json,
+        } => {
+            let config = ygg::config::AppConfig::from_env()?;
+            let pool = ygg::db::create_pool(&config.database_url).await?;
+            if list {
+                ygg::cli::remember_cmd::list(&pool, all || global, limit, json).await?;
+            } else {
+                let agent_name = agent.unwrap_or_else(|| {
+                    std::env::var("YGG_AGENT_NAME").ok().unwrap_or_else(|| {
+                        std::env::current_dir()
+                            .ok()
+                            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+                            .unwrap_or_else(|| "ygg".to_string())
+                    })
+                });
+                ygg::cli::remember_cmd::remember(&pool, &text, global, &agent_name, json).await?;
             }
         }
         Commands::AgentTool { tool, agent } => {

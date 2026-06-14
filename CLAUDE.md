@@ -4,7 +4,7 @@ This project **is** Yggdrasil — a multi-agent coordination layer. We dogfood i
 
 ## Working in This Repo (Dogfooded Coordination)
 
-The SessionStart, UserPromptSubmit, Stop, PreCompact, and PreToolUse hooks are active. They prime agent context, deliver agent-to-agent messages, record token stats, enforce locks, and track state in Postgres. You will see prime output at the top of each session (`<!-- ygg:prime -->`). (ADR 0015: the similarity-retrieval / embedding layer was removed — there is no longer a `[ygg memory | ...]` injection.)
+The SessionStart, UserPromptSubmit, Stop, PreCompact, and PreToolUse hooks are active. They prime agent context, deliver agent-to-agent messages, record token stats, enforce locks, and track state in Postgres. You will see prime output at the top of each session (`<!-- ygg:prime -->`). (ADR 0015: the similarity-retrieval / embedding layer was removed — there is no longer a `[ygg memory | ...]` injection. `ygg remember` was later re-added as a plain, non-embedding note store; see below.)
 
 ### Quick Reference
 
@@ -18,7 +18,11 @@ ygg task claim <ref>                        # Take a task (assign + in_progress)
 ygg task show <ref>                         # Full detail for <prefix>-NNN or UUID
 ygg task close <ref> [--reason "..."]       # Complete a task
 ygg task dep <task> <blocker>               # Record dependency
+ygg task move <ref> <target-prefix>         # Reassign a misfiled task to another repo (renumbers the ref)
 ygg task dupes [--all] [--limit N]          # Probable duplicate pairs (string similarity)
+
+ygg remember "..."                          # Durable note (repo-scoped; --global for all repos)
+ygg remember --list [--all] [--limit N]     # Read stored notes (also surfaced in `ygg prime`)
 
 ygg status                                  # See all agents' state, locks, recent activity
 ygg lock acquire <resource-key>             # Lease a shared resource before editing
@@ -35,7 +39,7 @@ ygg logs --follow                           # Live event stream
 - **For parallel work** that warrants its own context window, prefer `ygg spawn` over the native Task/Agent tool. Spawned agents are tracked in the DB, get their own prime context, and participate in lock coordination.
 - **Before assuming you're alone**, check `ygg status`. Other agents may hold locks or be mid-task on related work.
 - **Task tracking** — use `ygg task` for anything that outlives the current session: creating work, recording dependencies, claiming, closing. Intra-turn checklists can stay in native TaskCreate; cross-session work lives in `ygg task`.
-- **Durable rules** — write them to `CLAUDE.md` (repo) or `~/.claude/CLAUDE.md` (global); for file-scoped engineering corrections use `ygg learn add` with a glob. (ADR 0015 removed `ygg remember` / the similarity retriever.)
+- **Durable rules** — write hard rules to `CLAUDE.md` (repo) or `~/.claude/CLAUDE.md` (global); for file-scoped engineering corrections use `ygg learn add` with a glob. For shorter cross-session notes use `ygg remember "..."` (repo-scoped, `--global` for everywhere) — a plain note store with no embeddings/similarity; recent notes surface in the prime block and via `ygg remember --list`.
 - **Do NOT** use `bd` / beads. This project uses `ygg task` instead.
 
 ## Terse for AI-tracking fields

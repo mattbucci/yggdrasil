@@ -483,6 +483,42 @@ impl<'a> TaskRepo<'a> {
         tx.commit().await
     }
 
+    /// Reassign a task to another repo, allocating a fresh per-repo sequence in
+    /// the destination (the human ref changes, e.g. `yggdrasil-42` → `canairy-7`;
+    /// the task_id is stable so deps, links, labels, and events follow). The old
+    /// seq in the source repo is not reclaimed — gaps are expected. Returns the
+    /// new seq. No-op guard against moving into the same repo lives in the CLI.
+    pub async fn move_to_repo(
+        &self,
+        task_id: Uuid,
+        target_repo_id: Uuid,
+        agent_id: Option<Uuid>,
+    ) -> Result<i32, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let new_seq = self.next_seq(target_repo_id, &mut tx).await?;
+
+        sqlx::query(
+            "UPDATE tasks SET repo_id = $2, seq = $3, updated_at = now() WHERE task_id = $1",
+        )
+        .bind(task_id)
+        .bind(target_repo_id)
+        .bind(new_seq)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO task_events (task_id, agent_id, kind, payload) VALUES ($1, $2, 'moved', $3)",
+        )
+        .bind(task_id)
+        .bind(agent_id)
+        .bind(serde_json::json!({ "repo_id": target_repo_id, "seq": new_seq }))
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(new_seq)
+    }
+
     pub async fn add_dep(&self, task_id: Uuid, blocker_id: Uuid) -> Result<(), sqlx::Error> {
         if task_id == blocker_id {
             return Err(sqlx::Error::Protocol("task cannot depend on itself".into()));
