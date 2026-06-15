@@ -68,7 +68,7 @@ pub async fn status(pool: &PgPool) -> Result<(), anyhow::Error> {
 /// `ygg scheduler dry-run` — print what `tick` would do without writing.
 /// Stage 1 implementation: shows what's runnable and what would be claimed.
 pub async fn dry_run(pool: &PgPool) -> Result<(), anyhow::Error> {
-    let runnable: Vec<(String, String, i32, i32)> = sqlx::query_as(
+    let runnable: Vec<(String, String, i32, i16)> = sqlx::query_as(
         r#"SELECT t.title, r.task_prefix, t.seq, t.priority
              FROM tasks t JOIN repos r USING (repo_id)
             WHERE t.runnable = TRUE
