@@ -24,6 +24,10 @@ ygg task dupes [--all] [--limit N]          # Probable duplicate pairs (string s
 ygg remember "..."                          # Durable note (repo-scoped; --global for all repos)
 ygg remember --list [--all] [--limit N]     # Read stored notes (also surfaced in `ygg prime`)
 
+ygg handoff save "..."                       # Checkpoint this session before /clear; also accepts stdin (`... | ygg handoff save` or `ygg handoff save -`)
+ygg handoff show                             # Print the current resume note
+ygg handoff clear                            # Drop it once resumed
+
 ygg status                                  # See all agents' state, locks, recent activity
 ygg lock acquire <resource-key>             # Lease a shared resource before editing
 ygg lock release <resource-key>             # Release when done
@@ -40,6 +44,7 @@ ygg logs --follow                           # Live event stream
 - **Before assuming you're alone**, check `ygg status`. Other agents may hold locks or be mid-task on related work.
 - **Task tracking** — use `ygg task` for anything that outlives the current session: creating work, recording dependencies, claiming, closing. Intra-turn checklists can stay in native TaskCreate; cross-session work lives in `ygg task`.
 - **Durable rules** — write hard rules to `CLAUDE.md` (repo) or `~/.claude/CLAUDE.md` (global); for file-scoped engineering corrections use `ygg learn add` with a glob. For shorter cross-session notes use `ygg remember "..."` (repo-scoped, `--global` for everywhere) — a plain note store with no embeddings/similarity; recent notes surface in the prime block and via `ygg remember --list`.
+- **Before a context reset** (`/clear` or compaction), write a resume note with `ygg handoff save` — the work in flight, the next concrete step, open PRs/decisions. It is keyed to this repo + agent and leads the next `ygg prime` automatically, so the fresh session continues without re-explaining. `ygg handoff save` replaces the prior note; `ygg handoff clear` drops it once resumed.
 - **Do NOT** use `bd` / beads. This project uses `ygg task` instead.
 
 ## Terse for AI-tracking fields

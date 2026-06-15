@@ -4,11 +4,14 @@ use crate::{
     lock::LockManager,
     models::{
         agent::AgentRepo,
+        handoff::{Handoff, HandoffRepo},
         memory::{Memory, MemoryRepo},
         repo::{RepoRepo, detect_git_repo, slugify},
         task::{Task, TaskRepo},
     },
 };
+use chrono::{DateTime, Utc};
+use uuid::Uuid;
 
 /// Output agent context as markdown — injected by SessionStart and PreCompact hooks.
 /// Accepts an optional transcript path to estimate context pressure from file size.
@@ -37,6 +40,7 @@ struct PrimeContext {
     ready_tasks: Vec<Task>,
     open_count: i64,
     notes: Vec<Memory>,
+    handoff: Option<Handoff>,
     pending_migrations: usize,
 }
 
@@ -79,7 +83,14 @@ async fn try_with_db(
         transcript_path.and_then(|p| std::fs::metadata(p).ok().map(|m| (m.len() / 10) as i64));
 
     // Best-effort: detect current repo, surface a few ready tasks + recent notes.
-    let (repo_label, ready_tasks, open_count, notes) = resolve_repo_context(&pool).await;
+    let (repo_label, repo_id, ready_tasks, open_count, notes) = resolve_repo_context(&pool).await;
+
+    // Resume note from a prior session of this agent in this repo (`ygg handoff`).
+    let handoff = HandoffRepo::new(&pool)
+        .latest(repo_id, Some(agent.agent_id))
+        .await
+        .ok()
+        .flatten();
 
     let pending_migrations = db::pending_migrations(&pool)
         .await
@@ -97,13 +108,14 @@ async fn try_with_db(
         ready_tasks,
         open_count,
         notes,
+        handoff,
         pending_migrations,
     })
 }
 
 async fn resolve_repo_context(
     pool: &sqlx::PgPool,
-) -> (Option<String>, Vec<Task>, i64, Vec<Memory>) {
+) -> (Option<String>, Option<Uuid>, Vec<Task>, i64, Vec<Memory>) {
     // Recent global notes show even outside a known repo.
     let global_notes = || async {
         MemoryRepo::new(pool)
@@ -112,7 +124,7 @@ async fn resolve_repo_context(
             .unwrap_or_default()
     };
     let Ok(cwd) = std::env::current_dir() else {
-        return (None, vec![], 0, global_notes().await);
+        return (None, None, vec![], 0, global_notes().await);
     };
     let repo_repo = RepoRepo::new(pool);
 
@@ -133,7 +145,7 @@ async fn resolve_repo_context(
     };
 
     let Some(repo) = repo_opt else {
-        return (None, vec![], 0, global_notes().await);
+        return (None, None, vec![], 0, global_notes().await);
     };
     let task_repo = TaskRepo::new(pool);
     let ready = task_repo.ready(repo.repo_id).await.unwrap_or_default();
@@ -145,6 +157,7 @@ async fn resolve_repo_context(
         .unwrap_or_default();
     (
         Some(format!("{} ({})", repo.name, repo.task_prefix)),
+        Some(repo.repo_id),
         ready,
         open_count,
         notes,
@@ -185,6 +198,20 @@ fn print_rich(agent_name: &str, ctx: &PrimeContext) {
         "**state** {state}  ·  **context** {bar}{pct}% ({tok_display})  ·  **locks** {lock_str}",
         state = ctx.state,
     );
+
+    // Resume note from a prior session — the most important thing on a fresh
+    // window, so it leads. Supersede with `ygg handoff save`, drop with `clear`.
+    if let Some(h) = &ctx.handoff {
+        println!();
+        println!(
+            "## ⏎ Resume here — handoff from {}",
+            humanize_age(h.created_at)
+        );
+        println!();
+        println!("{}", h.text);
+        println!();
+        println!("*(supersede with `ygg handoff save`, dismiss with `ygg handoff clear`)*");
+    }
 
     if ctx.pending_migrations > 0 {
         println!();
@@ -295,6 +322,17 @@ fn print_degraded(agent_name: &str, err: &anyhow::Error) {
         "Once the DB is reachable, `ygg prime` emits agent-coordination rules — for now, \
         coordinate via `ygg lock acquire/release`, `ygg spawn`, `ygg status`. Do not use `bd` / beads."
     );
+}
+
+/// Coarse "Nx ago" age for the handoff header. Best-effort, human-facing.
+fn humanize_age(created: DateTime<Utc>) -> String {
+    let secs = (Utc::now() - created).num_seconds().max(0);
+    match secs {
+        0..=59 => "just now".to_string(),
+        60..=3599 => format!("{}m ago", secs / 60),
+        3600..=86399 => format!("{}h ago", secs / 3600),
+        _ => format!("{}d ago", secs / 86400),
+    }
 }
 
 /// One-line note preview for the prime block — collapse newlines, cap length.

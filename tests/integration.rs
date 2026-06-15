@@ -1576,3 +1576,50 @@ async fn test_agent_list_returns_current_user_agents() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn test_handoff_save_supersedes_and_clears() {
+    // `ygg handoff`: one note per (repo, agent); save replaces; clear removes.
+    let db_url = env::var("DATABASE_URL").expect("DATABASE_URL required");
+    let pool = ygg::db::create_pool(&db_url).await.unwrap();
+
+    sqlx::query("DELETE FROM repos WHERE task_prefix = 'handoff-test'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let repo: (uuid::Uuid,) = sqlx::query_as(
+        "INSERT INTO repos (canonical_url, name, task_prefix) VALUES (NULL, 'handoff-test', 'handoff-test') RETURNING repo_id"
+    ).fetch_one(&pool).await.unwrap();
+
+    let hr = ygg::models::handoff::HandoffRepo::new(&pool);
+
+    // First save, then read back.
+    hr.save(Some(repo.0), None, "first note").await.unwrap();
+    let got = hr.latest(Some(repo.0), None).await.unwrap().unwrap();
+    assert_eq!(got.text, "first note");
+
+    // A second save supersedes — latest is the new text, and only one row exists.
+    hr.save(Some(repo.0), None, "second note").await.unwrap();
+    let got = hr.latest(Some(repo.0), None).await.unwrap().unwrap();
+    assert_eq!(got.text, "second note", "save replaces the prior handoff");
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM handoffs WHERE repo_id = $1")
+        .bind(repo.0)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1, "exactly one handoff per (repo, agent)");
+
+    // Clear removes it.
+    let cleared = hr.clear(Some(repo.0), None).await.unwrap();
+    assert!(cleared, "clear reports it removed a handoff");
+    assert!(
+        hr.latest(Some(repo.0), None).await.unwrap().is_none(),
+        "no handoff after clear"
+    );
+
+    sqlx::query("DELETE FROM repos WHERE repo_id = $1")
+        .bind(repo.0)
+        .execute(&pool)
+        .await
+        .unwrap();
+}

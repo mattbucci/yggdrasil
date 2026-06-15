@@ -325,6 +325,14 @@ enum Commands {
         json: bool,
     },
 
+    /// Checkpoint the current session so a fresh one (after `/clear`) resumes
+    /// without re-explaining. The saved note auto-surfaces at the top of the
+    /// next `ygg prime`. Subcommands: save / show / clear.
+    Handoff {
+        #[command(subcommand)]
+        action: HandoffAction,
+    },
+
     /// Record that the agent is about to invoke a tool — PreToolUse hook.
     AgentTool {
         /// Tool name (Bash, Edit, Read, …)
@@ -648,6 +656,33 @@ enum LockAction {
         stale: bool,
         #[arg(long, default_value = "600")]
         stale_secs: i64,
+    },
+}
+
+#[derive(Subcommand)]
+enum HandoffAction {
+    /// Save a resume note for this repo+agent (replaces any prior one). Pass
+    /// the text as an argument, or omit it / pass `-` to read from stdin.
+    Save {
+        /// The handoff text. Omit or use `-` to read stdin.
+        #[arg(default_value = "", allow_hyphen_values = true)]
+        text: String,
+        #[arg(short, long)]
+        agent: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print the current handoff for this repo+agent.
+    Show {
+        #[arg(short, long)]
+        agent: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete the current handoff for this repo+agent.
+    Clear {
+        #[arg(short, long)]
+        agent: Option<String>,
     },
 }
 
@@ -2073,6 +2108,33 @@ async fn main() -> anyhow::Result<()> {
                     })
                 });
                 ygg::cli::remember_cmd::remember(&pool, &text, global, &agent_name, json).await?;
+            }
+        }
+        Commands::Handoff { action } => {
+            let config = ygg::config::AppConfig::from_env()?;
+            let pool = ygg::db::create_pool(&config.database_url).await?;
+            match action {
+                HandoffAction::Save { text, agent, json } => {
+                    let agent_name = resolve_agent_arg(agent);
+                    // Empty or `-` reads the note from stdin (pipe-friendly).
+                    let text = if text.is_empty() || text == "-" {
+                        use std::io::Read;
+                        let mut buf = String::new();
+                        std::io::stdin().read_to_string(&mut buf)?;
+                        buf
+                    } else {
+                        text
+                    };
+                    ygg::cli::handoff_cmd::save(&pool, &text, &agent_name, json).await?;
+                }
+                HandoffAction::Show { agent, json } => {
+                    let agent_name = resolve_agent_arg(agent);
+                    ygg::cli::handoff_cmd::show(&pool, &agent_name, json).await?;
+                }
+                HandoffAction::Clear { agent } => {
+                    let agent_name = resolve_agent_arg(agent);
+                    ygg::cli::handoff_cmd::clear(&pool, &agent_name).await?;
+                }
             }
         }
         Commands::AgentTool { tool, agent } => {
