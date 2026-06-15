@@ -1,0 +1,9 @@
+[workspace]
+# ygg is a binary crate — don't publish to crates.io. release-plz only
+# bumps the version, regenerates CHANGELOG.md, tags, and cuts a GitHub
+# release. To enable crates.io publishing later: set `publish = true` and
+# add a CARGO_REGISTRY_TOKEN secret consumed by the release job.
+publish = false
+git_release_enable = true
+git_tag_enable = true
+changelog_update = true
