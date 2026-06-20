@@ -64,6 +64,10 @@ enum Commands {
         /// PostgreSQL connection URL (overrides DATABASE_URL)
         #[arg(long)]
         database_url: Option<String>,
+        /// Run unattended: answer every prompt with its default (no stdin).
+        /// For the install script, CI, and spawned agents.
+        #[arg(short = 'y', long = "yes", visible_alias = "non-interactive")]
+        yes: bool,
     },
 
     /// Run database migrations
@@ -1072,6 +1076,7 @@ async fn main() -> anyhow::Result<()> {
             skip,
             reset,
             database_url,
+            yes,
         } => {
             if reset {
                 let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
@@ -1084,7 +1089,7 @@ async fn main() -> anyhow::Result<()> {
                     std::env::set_var("DATABASE_URL", url);
                 }
             }
-            ygg::cli::init::execute_with_options(verbose, &skip).await?;
+            ygg::cli::init::execute_with_options(verbose, &skip, yes).await?;
         }
         Commands::Migrate { check } => {
             let config = ygg::config::AppConfig::from_env()?;

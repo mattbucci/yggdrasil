@@ -141,4 +141,7 @@ echo ""
 echo "Bootstrapping dependencies..."
 echo ""
 
-ygg init
+# Unattended: this script is typically run via `curl ... | sh`, where stdin is
+# the pipe — so init must not block on interactive prompts. --yes takes the
+# default for every prompt. Re-run `ygg init` by hand to customize.
+ygg init --yes
