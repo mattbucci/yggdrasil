@@ -784,6 +784,10 @@ enum TaskAction {
         /// Read the description body from stdin (single-task mode).
         #[arg(long)]
         stdin: bool,
+        /// Print a fill-in task scaffold (Why/What + Definition-of-Done
+        /// checklist) to stdout and exit. Writes nothing to the DB.
+        #[arg(long)]
+        template: bool,
     },
     /// List tasks (defaults to current repo; pass --all for every repo)
     List {
@@ -891,6 +895,13 @@ enum TaskAction {
         reason: Option<String>,
         #[arg(short, long)]
         agent: Option<String>,
+        /// Block the close while the acceptance checklist has unticked `- [ ]`
+        /// boxes (also enabled by YGG_CLOSE_REQUIRES_ACCEPTANCE=1).
+        #[arg(long)]
+        require_acceptance: bool,
+        /// Close even when acceptance criteria are unmet.
+        #[arg(long)]
+        force: bool,
     },
     /// Change a task's status
     Status {
@@ -1540,10 +1551,13 @@ async fn main() -> anyhow::Result<()> {
                     file,
                     body_file,
                     stdin,
+                    template,
                 } => {
                     let agent_name = agent.unwrap_or_else(default_agent);
                     // Mode dispatch — mutually exclusive.
-                    if let Some(path) = file {
+                    if template {
+                        ygg::cli::task_cmd::print_task_template();
+                    } else if let Some(path) = file {
                         if !title.is_empty() {
                             anyhow::bail!("--file and a positional title are mutually exclusive");
                         }
@@ -1666,10 +1680,19 @@ async fn main() -> anyhow::Result<()> {
                     reference,
                     reason,
                     agent,
+                    require_acceptance,
+                    force,
                 } => {
                     let agent_name = agent.unwrap_or_else(default_agent);
-                    ygg::cli::task_cmd::close(&pool, &reference, reason.as_deref(), &agent_name)
-                        .await?;
+                    ygg::cli::task_cmd::close(
+                        &pool,
+                        &reference,
+                        reason.as_deref(),
+                        &agent_name,
+                        require_acceptance,
+                        force,
+                    )
+                    .await?;
                 }
                 TaskAction::Status {
                     reference,

@@ -402,7 +402,12 @@ pub async fn show(pool: &sqlx::PgPool, reference: &str, json: bool) -> Result<()
     }
     if let Some(a) = &t.acceptance {
         println!();
-        println!("  Acceptance:");
+        let (checked, total) = acceptance_checkbox_counts(a);
+        if total > 0 {
+            println!("  Acceptance (Definition of Done):  ({checked}/{total})");
+        } else {
+            println!("  Acceptance (Definition of Done):");
+        }
         for line in a.lines() {
             println!("    {line}");
         }
@@ -671,9 +676,37 @@ pub async fn close(
     reference: &str,
     reason: Option<&str>,
     agent_name: &str,
+    require_acceptance: bool,
+    force: bool,
 ) -> Result<(), anyhow::Error> {
     let t = resolve_task(pool, reference).await?;
     let agent_id = resolve_agent_id(pool, agent_name).await?;
+
+    // Definition-of-Done gate. When acceptance is a checklist with unticked
+    // boxes, warn by default — or block when --require-acceptance (or
+    // YGG_CLOSE_REQUIRES_ACCEPTANCE=1) is set — unless --force overrides. The
+    // check is purely structural (are the boxes ticked?); honesty of a tick is
+    // the agent's job. Free-text / empty acceptance has total == 0 and is
+    // never gated, so existing tasks and flows are unaffected.
+    if let Some(a) = &t.acceptance {
+        let (checked, total) = acceptance_checkbox_counts(a);
+        if total > 0 && checked < total {
+            let unmet = total - checked;
+            let gated = require_acceptance
+                || std::env::var("YGG_CLOSE_REQUIRES_ACCEPTANCE")
+                    .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+                    .unwrap_or(false);
+            if gated && !force {
+                anyhow::bail!(
+                    "{unmet} of {total} acceptance criteria unchecked — verify them and tick the \
+                     boxes via `ygg task update {reference} --acceptance \"...\"`, or pass --force"
+                );
+            }
+            eprintln!(
+                "⚠ closing {reference} with {unmet} of {total} acceptance criteria unchecked"
+            );
+        }
+    }
 
     // Finalize the current run BEFORE flipping task status so the event
     // ordering is run_terminal → task_status_changed.
@@ -685,6 +718,71 @@ pub async fn close(
     .await?;
 
     set_status(pool, reference, "closed", reason, agent_name).await
+}
+
+/// Count Definition-of-Done checkboxes in an `acceptance` body. Recognizes
+/// GitHub-style task-list items — a line whose first non-space content is
+/// `- [ ]` / `- [x]` / `- [X]` (also `* [ ]`). Returns (checked, total).
+/// `total == 0` means the body is free-text acceptance with no checkboxes, so
+/// the close gate has nothing to verify structurally and leaves it alone.
+fn acceptance_checkbox_counts(acceptance: &str) -> (usize, usize) {
+    let mut checked = 0usize;
+    let mut total = 0usize;
+    for line in acceptance.lines() {
+        let item = line
+            .trim_start()
+            .strip_prefix("- ")
+            .or_else(|| line.trim_start().strip_prefix("* "));
+        let Some(item) = item.map(str::trim_start) else {
+            continue;
+        };
+        let Some(after) = item.strip_prefix('[') else {
+            continue;
+        };
+        let mut chars = after.chars();
+        match (chars.next(), chars.next()) {
+            (Some(' '), Some(']')) => total += 1,
+            (Some('x' | 'X'), Some(']')) => {
+                total += 1;
+                checked += 1;
+            }
+            _ => {}
+        }
+    }
+    (checked, total)
+}
+
+/// Scaffold a well-formed task to stdout for `ygg task create --template`.
+/// Prints the recommended field layout — Why/What in `--description`, a
+/// Definition-of-Done checklist in `--acceptance` — as a copy-paste command
+/// skeleton. Writes nothing to the DB.
+pub fn print_task_template() {
+    print!(
+        r#"# ygg task scaffold — fill in the <...> slots, then run the command.
+# --description Context is the one field you do NOT compress: the agent picks
+#   this up cold and must not know less than the conversation that spawned it.
+# --acceptance is the Definition of Done: a `- [ ]` checklist, each box binary
+#   pass/fail verifiable (path, command, numeric threshold). Repo-wide gates
+#   (cargo test/check/fmt, locks, PR) are standing DoD — note only deviations.
+# --design bounds scope: hard constraints + non-goals (ask before expanding).
+# Long context? pipe it: --body-file spec.md  (or)  ... | ygg task create --stdin
+
+ygg task create "<imperative title, <=60 chars>" \
+  --kind <task|bug|feature|chore|epic> --priority <0-4> \
+  --description "Why: <one sentence, cite source: Adversarial review: / Incident <date>: / ...>.
+What: <one sentence, imperative>.
+
+Context: <full background from the conversation — situation, decisions already
+made, alternatives rejected and why, file/function pointers. Don't make the
+agent re-derive what chat already settled.>" \
+  --acceptance "- [ ] <verifiable criterion: path / command / threshold>
+- [ ] cargo test passes
+- [ ] cargo check --all-targets clean" \
+  --design "Constraints (use exactly this unless hard blocker): <which files/approach>.
+Out of scope — ask before doing: <what NOT to expand into; deps/features needing approval>." \
+  --notes "Refs: <yggdrasil-NN, ADR-NNNN, URL>"
+"#
+    );
 }
 
 /// Heuristic mapping from free-text close reason → run terminal state. Manual
@@ -1388,7 +1486,7 @@ async fn print_task_table(pool: &sqlx::PgPool, tasks: &[Task]) -> Result<(), any
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_agent_slug;
+    use super::{acceptance_checkbox_counts, sanitize_agent_slug};
 
     #[test]
     fn slug_lowercases_and_dashes_separators() {
@@ -1421,5 +1519,30 @@ mod tests {
         let long = "a".repeat(100);
         let s = sanitize_agent_slug(&long).unwrap();
         assert!(s.len() <= 40, "slug should be capped, got {}", s.len());
+    }
+
+    #[test]
+    fn checkbox_counts_mixed() {
+        let body = "- [ ] one\n- [x] two\n- [X] three\n- [ ] four";
+        assert_eq!(acceptance_checkbox_counts(body), (2, 4));
+    }
+
+    #[test]
+    fn checkbox_counts_indented_and_star() {
+        let body = "  - [x] indented\n* [ ] star bullet";
+        assert_eq!(acceptance_checkbox_counts(body), (1, 2));
+    }
+
+    #[test]
+    fn checkbox_counts_free_text_is_zero() {
+        // No `- [ ]` lines → not a checklist → never gated.
+        let body = "- plain bullet\nsome prose\n[ ] not a list item";
+        assert_eq!(acceptance_checkbox_counts(body), (0, 0));
+    }
+
+    #[test]
+    fn checkbox_counts_all_done() {
+        let body = "- [x] a\n- [X] b";
+        assert_eq!(acceptance_checkbox_counts(body), (2, 2));
     }
 }

@@ -25,6 +25,7 @@ ADRs are append-only. Superseded decisions get a new ADR that references the old
 | 0015 | [Retrieval scope reduction — pivot toward orchestrator-only](0015-retrieval-scope-reduction.md) | Proposed |
 | 0016 | [Autonomous execution — scheduler + durable task runs](0016-autonomous-execution.md) | Proposed |
 | 0017 | [Learnings: approval gate + agent-proposed capture](0017-learning-capture-and-approval.md) | Proposed |
+| 0018 | [Task acceptance as a Definition-of-Done checklist](0018-task-acceptance-checklists.md) | Proposed |
 
 ## Writing a new ADR
 

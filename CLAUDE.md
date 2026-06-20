@@ -166,46 +166,86 @@ ygg task dupes [--all] [--limit N]          # Probable duplicate pairs (string s
 
 ### Ticket body structure
 
-Tickets are read by other agents picking up the work. Bodies have **four
-sections in this order**, separated by blank lines. No PR-prose walls.
+Tickets are authored and consumed by autonomous agents. Use the **dedicated
+fields** — do NOT cram everything into `--description`. `ygg task show`
+renders `acceptance`/`design`/`notes` as their own sections; a blob in
+`--description` leaves those columns NULL. Run `ygg task create --template`
+for a fill-in scaffold.
 
-1. **Why** — one sentence. The trigger or observation that justifies the
-   work. Cite the source: `Adversarial review:`, `Codebase audit:`,
-   `Bench scenario X:`, `Research thread Y:`, `Incident on <date>:`.
-2. **What** — one sentence. The concrete change. Use imperative voice.
-3. **Acceptance:** — a bulleted list of testable conditions. Each bullet
-   is something an autonomous agent can verify when claiming the task as
-   done. Avoid vague verbs ("improve", "consider"); pin SHAs, file paths,
-   commands, numeric thresholds.
-4. **Refs:** *(optional)* — research thread tag, related ticket
-   (`yggdrasil-NN`), external URL, ADR number.
+- **`--description`** — **Why** (one sentence, cite the source:
+  `Adversarial review:`, `Codebase audit:`, `Incident <date>:`), **What** (one
+  sentence, imperative), then **Context** — full-fidelity background. The
+  agent that claims this task starts cold; it must not know *less* than the
+  conversation that spawned the task. Capture the situation, decisions already
+  made, alternatives ruled out and *why*, and pointers (files, functions,
+  prior tickets). This is the one field where you do **not** compress — close
+  the knowledge gap between chat and ticket. Long? pipe it via `--body-file` /
+  `--stdin`. No `## headers`.
+- **`--acceptance`** — the **Definition of Done**, as a `- [ ]` checkbox list.
+  One box per *independently verifiable* condition; pin paths, commands,
+  numeric thresholds. No vague verbs ("improve", "consider"). This is
+  per-task correctness — "did I build the right thing".
+- **`--design`** *(optional)* — **Constraints** ("use exactly this unless a
+  hard blocker": stack, approach, which files to touch) and **Non-goals** —
+  what NOT to expand into, and what needs approval first. Ask before adding a
+  dependency, feature, or surface the ticket didn't name. This bounds scope
+  the way `--acceptance` bounds done-ness.
+- **`--notes`** *(optional)* — `Refs:` (`yggdrasil-NN`, ADR number, URL) and
+  any DoD deviation.
+
+**Definition of Done is two layers.** The per-task `--acceptance` checklist
+above, **plus** the repo-wide gates that apply to every task and are NOT
+retyped per ticket: `cargo test` + `cargo check --all-targets` +
+`cargo fmt --check` pass, locks released, branch pushed, PR open (see Session
+Completion). Record only *deviations* from the repo gates in `--notes`.
+
+**Before `ygg task close`:** re-read `ygg task show`, run each acceptance
+box's check, and tick the ones you verified (`ygg task update <ref>
+--acceptance "..."`). `ygg task show` prints a live `(checked/total)` count.
+`ygg task close` warns when boxes are unticked, and **blocks** under
+`--require-acceptance` (or `YGG_CLOSE_REQUIRES_ACCEPTANCE=1`) unless `--force`.
 
 Example:
 
-```text
-Adversarial review: src/db.rs max_connections(10) starves a fleet of
-50+ active agents.
+```bash
+ygg task create "bump db pool default to 32" --kind chore --priority 1 \
+  --description "Why: adversarial review found src/db.rs max_connections(10) starves 50+ agent fleets.
+What: raise the pool default to 32; accept a YGG_DB_POOL override.
 
-Bump default to 32 and accept YGG_DB_POOL env override.
-
-Acceptance:
-- src/db.rs default = 32; YGG_DB_POOL parses to u32, falls back on error
-- CLAUDE.md documents the knob in the Build & Test section
-- cargo check --all-targets clean
-
-Refs: yggdrasil-141, adversarial-review note 2026-04-23
+Context: the scheduler, watcher, TUI, and per-agent hooks all draw from one
+sqlx pool. At 10 connections a >50-agent fleet blocks on connection-wait, which
+surfaces as spurious tick lag (looked like a scheduler bug for a week). We chose
+32 as the floor that cleared the lag in the bench without exhausting Postgres'
+default 100 max_connections, leaving headroom for psql/manual sessions. Rejected
+making it unbounded (risks hitting Postgres' cap) and per-component pools (more
+moving parts). Knob lives next to the pool builder in src/db.rs." \
+  --acceptance "- [ ] src/db.rs default = 32
+- [ ] YGG_DB_POOL parses to u32, falls back to 32 on parse error
+- [ ] CLAUDE.md Build & Test documents YGG_DB_POOL
+- [ ] cargo test passes
+- [ ] cargo check --all-targets clean" \
+  --design "Constraints: change only src/db.rs pool builder + the CLAUDE.md knob doc.
+Out of scope — ask first: no migration, no new config file, don't touch hook scripts." \
+  --notes "Refs: yggdrasil-141, adversarial-review note 2026-04-23"
 ```
 
 ### Terse for AI-tracking fields
 
-When writing content that only agents consume — `ygg task create`
-titles/descriptions/acceptance/design/notes, `ygg learn` rules — be
-terse. Drop filler (really/just/basically/actually/very). Drop articles
-(`a`/`an`/`the`) when meaning survives.
-Prefer one sentence per field where content allows. **Preserve
-verbatim**: identifiers (snake_case, CamelCase), paths, commands,
+When writing content that only agents consume — `ygg task create` titles,
+the `--acceptance` checklist, `ygg learn` rules — be terse. Drop filler
+(really/just/basically/actually/very). Drop articles (`a`/`an`/`the`) when
+meaning survives. Prefer one sentence per criterion where content allows.
+**Preserve verbatim**: identifiers (snake_case, CamelCase), paths, commands,
 numbers, URLs, and modal keywords (always/never/must/should/cannot/
 don't/may/shall).
+
+**Exception — the `--description` Context paragraph is NOT terse.** Terseness
+on context is what creates the knowledge gap between a Claude conversation and
+the ticket an agent later picks up cold. Write the background in full: the
+situation, the decisions and the reasoning behind them, alternatives rejected,
+and file/function pointers. Compress the *criteria*, not the *context*. (The
+`--design` constraints/non-goals are likewise full-fidelity where scope is
+non-obvious.)
 
 Does **NOT** apply to commit messages, PR descriptions, code comments,
 or chat responses — those are human-facing and full fidelity is correct.
