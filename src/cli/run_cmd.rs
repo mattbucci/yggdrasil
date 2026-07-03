@@ -306,6 +306,16 @@ fn print_run(run: &TaskRun) {
     if let Some(s) = &run.session_id {
         println!("session_id:       {s}");
     }
+    // Backend routing: for hermes-backed runs the work executed on a gateway
+    // agent, not a local tmux window, so surface the backend + the remote task
+    // id (cross-reference with `ygg hermes show <id>`). Default 'tmux' is the
+    // common case and stays quiet.
+    if run.backend != "tmux" {
+        println!("backend:          {}", run.backend);
+    }
+    if let Some(rid) = &run.remote_task_id {
+        println!("remote_task_id:   {rid}");
+    }
     println!("max_attempts:     {}", run.max_attempts);
     if let Some(sha) = &run.output_commit_sha {
         println!("commit:           {sha}");
@@ -322,6 +332,54 @@ fn print_run(run: &TaskRun) {
     if let Some(f) = &run.fingerprint {
         println!("fingerprint:      {f}");
     }
+    // Captured result / error. For hermes-backed runs the agent's answer lands
+    // in output.content; local runs use output.summary. Show whichever is
+    // present so an operator can read the outcome without querying the DB.
+    if let Some(text) = run.error.as_ref().and_then(run_text_field) {
+        println!("\nerror:\n{}", indent_block(&text));
+    } else if let Some(text) = run.output.as_ref().and_then(run_text_field) {
+        println!("\noutput:\n{}", indent_block(&text));
+    } else if run.state.is_terminal() {
+        // A terminal run with no extractable text (e.g. a hermes agent that
+        // stopped without emitting a final message — output_bytes:0) would
+        // otherwise render as a blank record, indistinguishable from "not
+        // fetched". Say so explicitly.
+        println!("\noutput:           (none captured)");
+    }
+}
+
+/// Pull a human-readable string out of a run's output/error JSON blob, trying
+/// the fields our backends populate (`content` for hermes, `summary`/`message`
+/// for local runs and errors) before falling back to nothing.
+fn run_text_field(v: &serde_json::Value) -> Option<String> {
+    for key in ["content", "summary", "message"] {
+        if let Some(s) = v.get(key).and_then(|x| x.as_str()) {
+            let s = s.trim();
+            if !s.is_empty() {
+                return Some(s.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Indent a (possibly multi-line) block by two spaces, capping very long output
+/// so `run show` stays scannable; the full blob is always in the DB / spool.
+fn indent_block(text: &str) -> String {
+    const MAX: usize = 4000;
+    let (body, truncated) = match text.char_indices().nth(MAX) {
+        Some((byte_idx, _)) => (&text[..byte_idx], true),
+        None => (text, false),
+    };
+    let mut out: String = body
+        .lines()
+        .map(|l| format!("  {l}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if truncated {
+        out.push_str("\n  … (truncated)");
+    }
+    out
 }
 
 fn print_run_row(run: &TaskRun) {
@@ -522,4 +580,54 @@ fn commit_after(cwd: &std::path::Path, sha: &str, started: chrono::DateTime<chro
         return false;
     };
     parsed.with_timezone(&chrono::Utc) >= started
+}
+
+#[cfg(test)]
+mod show_output_tests {
+    use super::{indent_block, run_text_field};
+    use serde_json::json;
+
+    #[test]
+    fn extracts_hermes_content_field() {
+        let v =
+            json!({"backend":"hermes","content":"print(sum(range(1,101)))","finish_reason":"stop"});
+        assert_eq!(
+            run_text_field(&v).as_deref(),
+            Some("print(sum(range(1,101)))")
+        );
+    }
+
+    #[test]
+    fn prefers_content_then_summary_then_message() {
+        assert_eq!(
+            run_text_field(&json!({"summary":"s"})).as_deref(),
+            Some("s")
+        );
+        assert_eq!(
+            run_text_field(&json!({"message":"m"})).as_deref(),
+            Some("m")
+        );
+        // content wins when several are present
+        assert_eq!(
+            run_text_field(&json!({"content":"c","summary":"s","message":"m"})).as_deref(),
+            Some("c")
+        );
+    }
+
+    #[test]
+    fn ignores_blank_and_missing_fields() {
+        assert_eq!(run_text_field(&json!({"content":"   "})), None);
+        assert_eq!(run_text_field(&json!({"usage":{"tokens":3}})), None);
+        assert_eq!(run_text_field(&json!({})), None);
+    }
+
+    #[test]
+    fn indents_multiline_and_caps_length() {
+        assert_eq!(indent_block("a\nb"), "  a\n  b");
+        let long = "x".repeat(5000);
+        let out = indent_block(&long);
+        assert!(out.ends_with("… (truncated)"));
+        // capped near MAX + indent + marker, not the full 5000
+        assert!(out.len() < 4100, "len was {}", out.len());
+    }
 }
