@@ -352,6 +352,12 @@ enum Commands {
         #[clap(subcommand)]
         action: ygg::cli::hook_cmd::HookAction,
     },
+
+    /// Control and monitor the hermes-gateway orchestrator layer
+    Hermes {
+        #[command(subcommand)]
+        action: ygg::cli::hermes_cmd::HermesAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2275,6 +2281,10 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Hook { action } => {
             ygg::cli::hook_cmd::handle(action).await?;
+        }
+        Commands::Hermes { action } => {
+            let config = ygg::config::AppConfig::from_env()?;
+            ygg::cli::hermes_cmd::handle(&config, action).await?;
         }
     }
 

@@ -169,6 +169,15 @@ pub struct TaskRun {
     pub fingerprint: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Execution backend: `'tmux'` (default, local worker) or `'hermes'`
+    /// (a sandboxed agent behind hermes-gateway). Added in
+    /// 20260702000002_task_run_backend.sql.
+    #[sqlx(default)]
+    pub backend: String,
+    /// For `backend = 'hermes'`: the gateway task id the scheduler polls to
+    /// reconcile terminal state. NULL for tmux runs.
+    #[sqlx(default)]
+    pub remote_task_id: Option<String>,
 }
 
 /// Inputs for inserting a fresh run. Most fields default sensibly; callers

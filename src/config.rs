@@ -14,6 +14,13 @@ pub struct AppConfig {
     pub heartbeat_interval_secs: u64,
     pub watcher_interval_secs: u64,
     pub rtk_binary_path: String,
+    /// Base URL of the hermes-gateway router, e.g.
+    /// `http://hermes-gateway.ph.ca:8642`. None disables all hermes features.
+    pub hermes_gateway_url: Option<String>,
+    /// Bearer token for the OpenAI-compatible + task API (`/v1/*`).
+    pub hermes_gateway_token: Option<String>,
+    /// Separate bearer token for the ops dashboard API (`/dashboard/api/*`).
+    pub hermes_dashboard_token: Option<String>,
 }
 
 impl AppConfig {
@@ -50,6 +57,16 @@ impl AppConfig {
                 .parse()
                 .unwrap_or(30),
             rtk_binary_path: env::var("RTK_BINARY_PATH").unwrap_or_else(|_| "rtk".into()),
+            hermes_gateway_url: non_empty_env("HERMES_GATEWAY_URL"),
+            hermes_gateway_token: non_empty_env("HERMES_GATEWAY_TOKEN"),
+            hermes_dashboard_token: non_empty_env("HERMES_DASHBOARD_TOKEN"),
         })
     }
+}
+
+/// Read an environment variable, treating unset *and* empty as absent. Used
+/// for optional configuration where an empty string should not be mistaken
+/// for a real value.
+fn non_empty_env(name: &str) -> Option<String> {
+    env::var(name).ok().filter(|s| !s.is_empty())
 }

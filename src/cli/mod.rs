@@ -4,6 +4,8 @@ pub mod bench_cmd;
 pub mod chat_cmd;
 pub mod dashboard_cmd;
 pub mod handoff_cmd;
+pub mod hermes_backend;
+pub mod hermes_cmd;
 pub mod hook_cmd;
 pub mod init;
 pub mod init_project;

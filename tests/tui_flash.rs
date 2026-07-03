@@ -2,6 +2,20 @@
 
 use ygg::tui::app::{FlashState, OpsStats};
 
+use std::sync::{Mutex, MutexGuard, OnceLock};
+
+/// Serialize the tests in this file. `flash_disabled_via_env_var` mutates the
+/// process-global `YGG_TUI_NO_FLASH`, which `FlashState::mark_changes` reads —
+/// so while it is set, a sibling test running on another thread would observe
+/// flashing disabled and fail spuriously. Every test takes this lock so the
+/// env-var test never overlaps the others (pre-existing race, yggdrasil-152).
+fn serial() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 fn ops(alive: i64, stuck: i64, tasks: i64, sessions: i64) -> OpsStats {
     OpsStats {
         agents_alive: alive,
@@ -24,6 +38,7 @@ fn ops(alive: i64, stuck: i64, tasks: i64, sessions: i64) -> OpsStats {
 
 #[test]
 fn unchanged_snapshot_does_not_flash_anything() {
+    let _g = serial();
     let mut f = FlashState::default();
     f.mark_changes(&ops(3, 0, 1, 2), &ops(3, 0, 1, 2), 2);
     assert!(!f.is_flashing_alive());
@@ -34,6 +49,7 @@ fn unchanged_snapshot_does_not_flash_anything() {
 
 #[test]
 fn changed_alive_count_flashes_only_alive() {
+    let _g = serial();
     let mut f = FlashState::default();
     f.mark_changes(&ops(3, 0, 1, 2), &ops(4, 0, 1, 2), 2);
     assert!(f.is_flashing_alive());
@@ -44,6 +60,7 @@ fn changed_alive_count_flashes_only_alive() {
 
 #[test]
 fn flash_decays_to_zero_after_n_paints() {
+    let _g = serial();
     let mut f = FlashState::default();
     f.mark_changes(&ops(0, 0, 0, 0), &ops(1, 0, 0, 0), 2);
     assert!(f.is_flashing_alive());
@@ -55,7 +72,9 @@ fn flash_decays_to_zero_after_n_paints() {
 
 #[test]
 fn flash_disabled_via_env_var() {
-    // Use a key the rest of the suite never touches to avoid races.
+    let _g = serial();
+    // Holds `serial()` across the whole set/remove window so no sibling test
+    // observes YGG_TUI_NO_FLASH while it is set.
     unsafe { std::env::set_var("YGG_TUI_NO_FLASH", "1") };
     let mut f = FlashState::default();
     f.mark_changes(&ops(0, 0, 0, 0), &ops(1, 1, 1, 1), 2);
@@ -68,6 +87,7 @@ fn flash_disabled_via_env_var() {
 
 #[test]
 fn re_marking_a_live_flash_resets_the_window() {
+    let _g = serial();
     let mut f = FlashState::default();
     f.mark_changes(&ops(0, 0, 0, 0), &ops(1, 0, 0, 0), 3);
     f.tick_paint(); // 2 left
@@ -78,6 +98,7 @@ fn re_marking_a_live_flash_resets_the_window() {
 
 #[test]
 fn each_field_is_independent() {
+    let _g = serial();
     let mut f = FlashState::default();
     f.mark_changes(&ops(0, 0, 0, 0), &ops(1, 0, 1, 0), 2);
     assert!(f.is_flashing_alive());

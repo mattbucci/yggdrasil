@@ -116,6 +116,28 @@ One deliberate design choice: Yggdrasil is **global per user**, not per repo. On
 | `bar`       | Claude Code statusline generator (context pressure, cache rate, spend). |
 | `agent-tool`| Hook: record the tool an agent is about to call.                        |
 | `hook`      | Native Claude Code lifecycle hook handlers.                             |
+| `hermes`    | Control/monitor hermes-gateway: `status / agents / submit / tasks / show / output / cancel / rm / health / back`. |
+
+### Hermes gateway integration
+
+`ygg hermes` talks to a [hermes-gateway](../agent-sandbox/docs/hermes-gateway.md)
+router over HTTP (OpenAI-compatible + task + dashboard APIs). Point ygg at a
+gateway via `~/.config/ygg/.env`:
+
+```
+HERMES_GATEWAY_URL=http://hermes-gateway.ph.ca:8642
+HERMES_GATEWAY_TOKEN=hgw_...        # /v1/* (models, tasks); scope must allow the agent
+HERMES_DASHBOARD_TOKEN=hgwd_...     # /dashboard/api/* (ygg hermes status only)
+```
+
+Read commands accept `--json`. `ygg hermes status` renders the fleet overview
+(per-agent VM/queue state, task counts, traffic) and needs the dashboard token.
+
+The scheduler can also **dispatch DAG tasks to gateway agents** instead of local
+tmux. Mark a task hermes-backed with `ygg hermes back <task-ref> --agent
+feature-dev` (clear with `--off`); the scheduler then submits it via
+`POST /v1/tasks` and reconciles its terminal state by polling the gateway
+(`YGG_HERMES_POLL_SECS`, default 5). The default backend stays tmux.
 
 ## Project Layout
 

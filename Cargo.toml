@@ -70,6 +70,13 @@ crokey = "1"
 # Progress / spinners
 indicatif = "0.17"
 
+# HTTP client (hermes-gateway integration — first HTTP client in the tree)
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+    "stream",
+] }
+
 # Signal handling
 tokio-util = { version = "0.7", features = ["rt"] }
 regex = "1.12.3"
@@ -85,3 +92,5 @@ fs4 = { version = "0.13", features = ["sync"] }
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3"
+# Mock HTTP server for the hermes-gateway client tests (no network, no gateway).
+wiremock = "0.6"

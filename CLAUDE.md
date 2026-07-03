@@ -125,8 +125,9 @@ collisions between concurrent agents.
 ## Architecture Overview
 
 - **src/models/**: `agent` (state machine), `task` / `task_run` (tracking + scheduler runs), `event` (live stream).
-- **src/cli/**: one file per subcommand — `prime`, `spawn`, `lock`, `interrupt`, `status`, `logs`, `task_cmd`, `run_cmd`, `scheduler_cmd`, `hook_cmd`.
+- **src/cli/**: one file per subcommand — `prime`, `spawn`, `lock`, `interrupt`, `status`, `logs`, `task_cmd`, `run_cmd`, `scheduler_cmd`, `hook_cmd`, `hermes_cmd`, `hermes_backend`.
 - **src/lock.rs, src/scheduler.rs**: coordination primitives.
+- **src/hermes.rs + src/cli/hermes_cmd.rs**: typed hermes-gateway HTTP client and the `ygg hermes` command group (control/monitor the gateway; see README "Hermes gateway integration"). **src/cli/hermes_backend.rs**: optional scheduler backend that dispatches a task's run to a sandboxed gateway agent (`ygg hermes back <ref> --agent <a>`) instead of local tmux — default stays tmux. Env: `HERMES_GATEWAY_URL`, `HERMES_GATEWAY_TOKEN`, `HERMES_DASHBOARD_TOKEN`, `YGG_HERMES_DEFAULT_AGENT`, `YGG_HERMES_POLL_SECS`.
 - **migrations/**: SQLite schema (single squashed baseline; the tool was ported off Postgres in 2026-07). ADR 0015 removed the embedding/`nodes` tables.
 - **Hooks** → native `ygg hook <event>` handlers, installed by `ygg init` at Claude Code lifecycle events.
 

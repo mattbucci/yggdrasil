@@ -88,6 +88,9 @@ pub struct TickStats {
     pub deadlined: i64,
     pub retried: i64,
     pub poisoned: i64,
+    /// Running hermes-backed runs advanced to a terminal state this tick by
+    /// polling the gateway (Part B).
+    pub hermes_reconciled: i64,
 }
 
 /// Run one scheduler tick. Public so `ygg scheduler tick` can call it
@@ -96,6 +99,17 @@ pub async fn tick(pool: &DbPool, cfg: &SchedulerConfig) -> Result<TickStats, any
     let mut stats = TickStats::default();
     stats.reaped = reap_expired_heartbeats(pool).await?;
     stats.deadlined = enforce_deadlines(pool).await?;
+    // Reconcile running hermes-backed runs against the gateway BEFORE finalize,
+    // so a remote task that just went terminal writes its output/error and the
+    // same finalize_terminal_runs pass closes the parent task (Part B). Errors
+    // here (gateway hiccup) are non-fatal — the run is retried next tick.
+    stats.hermes_reconciled = match crate::cli::hermes_backend::reconcile_running(pool).await {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!(error = %e, "hermes reconcile failed");
+            0
+        }
+    };
     stats.poisoned = detect_loops(pool, cfg.poison_threshold).await?;
     // yggdrasil-112: retries MUST run before finalize. finalize closes the
     // parent task when the latest attempt is terminal; schedule_retries' guard
@@ -167,7 +181,8 @@ pub async fn run(pool: DbPool, cfg: SchedulerConfig) -> Result<(), anyhow::Error
                     + stats.reaped
                     + stats.deadlined
                     + stats.retried
-                    + stats.poisoned;
+                    + stats.poisoned
+                    + stats.hermes_reconciled;
                 if total > 0 {
                     tracing::info!(
                         finalized = stats.finalized,
@@ -177,6 +192,7 @@ pub async fn run(pool: DbPool, cfg: SchedulerConfig) -> Result<(), anyhow::Error
                         deadlined = stats.deadlined,
                         retried = stats.retried,
                         poisoned = stats.poisoned,
+                        hermes_reconciled = stats.hermes_reconciled,
                         "scheduler tick"
                     );
                     emit_simple_event(&pool, EventKind::SchedulerTick, serde_json::json!(stats))
@@ -379,6 +395,10 @@ pub async fn reap_expired_heartbeats(pool: &DbPool) -> Result<i64, anyhow::Error
                   ended_at = COALESCE(ended_at, strftime('%Y-%m-%dT%H:%M:%f+00:00','now')),
                   updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now')
             WHERE state = 'running'
+              -- Hermes runs have no local heartbeat (no in-process worker); the
+              -- gateway poller (hermes_backend::reconcile_running) owns their
+              -- liveness. Excluding them keeps the tmux reap byte-identical.
+              AND backend <> 'hermes'
               AND heartbeat_at IS NOT NULL
               AND heartbeat_at < strftime('%Y-%m-%dT%H:%M:%f+00:00','now','-' || heartbeat_ttl_s || ' seconds')
         RETURNING run_id, task_id, attempt, agent_id"#,
@@ -421,6 +441,9 @@ pub async fn enforce_deadlines(pool: &DbPool) -> Result<i64, anyhow::Error> {
                   ended_at = COALESCE(ended_at, strftime('%Y-%m-%dT%H:%M:%f+00:00','now')),
                   updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now')
             WHERE state = 'running'
+              -- Hermes deadlines are enforced by the gateway poller so it can
+              -- also POST /v1/tasks/{id}/cancel on the remote side.
+              AND backend <> 'hermes'
               AND deadline_at IS NOT NULL
               AND deadline_at < strftime('%Y-%m-%dT%H:%M:%f+00:00','now')
         RETURNING run_id, task_id, attempt"#,
@@ -974,6 +997,87 @@ pub async fn dispatch_ready(pool: &DbPool, cfg: &SchedulerConfig) -> Result<i64,
         };
 
         let task_ref = format!("{prefix}-{seq}");
+
+        // Part B: hermes-backed tasks dispatch to a sandboxed gateway agent
+        // instead of a local tmux worker. The tmux branch below is unchanged.
+        // The backend selector is a separate lightweight read so the tmux-path
+        // query above stays byte-identical.
+        let backend: Option<String> =
+            sqlx::query_scalar("SELECT backend FROM tasks WHERE task_id = $1")
+                .bind(&task_id)
+                .fetch_optional(pool)
+                .await?
+                .flatten();
+        if let Some(hermes_agent) = crate::cli::hermes_backend::hermes_agent(backend.as_deref()) {
+            let hermes_prompt = format!(
+                "{recovery}[ygg-scheduler] Task {task_ref} (attempt {attempt}): {title}\n\n{desc}",
+                recovery = recovery_note(&input),
+            );
+            match crate::cli::hermes_backend::dispatch(
+                pool,
+                &app_cfg,
+                &run_id,
+                &task_id,
+                &hermes_agent,
+                &hermes_prompt,
+            )
+            .await
+            {
+                Ok(remote_id) => {
+                    EventRepo::new(pool)
+                        .emit(
+                            EventKind::RunClaimed,
+                            "scheduler",
+                            None,
+                            serde_json::json!({
+                                "task_ref": task_ref,
+                                "run_id": run_id,
+                                "attempt": attempt,
+                                "backend": "hermes",
+                                "agent": hermes_agent,
+                                "remote_task_id": remote_id,
+                            }),
+                        )
+                        .await
+                        .ok();
+                    dispatched += 1;
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, task_ref = %task_ref, "hermes dispatch failed");
+                    sqlx::query(
+                        "UPDATE task_runs
+                            SET state = 'crashed',
+                                reason = 'agent_error',
+                                backend = 'hermes',
+                                error = json_object('reason_code', 'agent_error',
+                                                    'message', $2),
+                                ended_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now'),
+                                updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now')
+                          WHERE run_id = $1",
+                    )
+                    .bind(&run_id)
+                    .bind(err.to_string())
+                    .execute(pool)
+                    .await?;
+                    EventRepo::new(pool)
+                        .emit(
+                            EventKind::SchedulerError,
+                            "scheduler",
+                            None,
+                            serde_json::json!({
+                                "phase": "hermes_dispatch",
+                                "task_ref": task_ref,
+                                "run_id": run_id,
+                                "error": err.to_string(),
+                            }),
+                        )
+                        .await
+                        .ok();
+                }
+            }
+            continue;
+        }
+
         let agent_name = scheduler_agent_name(&prefix, seq, attempt, agent_slug.as_deref());
         let prompt = format!(
             "{recovery}[ygg-scheduler] Task {task_ref} (attempt {attempt}): {title}\n\n{desc}\n\n\
@@ -1316,6 +1420,9 @@ mod tests {
             heartbeat_interval_secs: 60,
             watcher_interval_secs: 30,
             rtk_binary_path: "rtk".into(),
+            hermes_gateway_url: None,
+            hermes_gateway_token: None,
+            hermes_dashboard_token: None,
         };
         unsafe { std::env::remove_var("YGG_SCHEDULER_TICK_MS") };
         unsafe { std::env::remove_var("YGG_SCHEDULER_MAX_CONCURRENT") };

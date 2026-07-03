@@ -6,6 +6,7 @@ pub mod cli;
 pub mod config;
 pub mod db;
 pub mod executor;
+pub mod hermes;
 pub mod interrupt;
 pub mod lock;
 pub mod models;
