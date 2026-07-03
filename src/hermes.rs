@@ -427,6 +427,10 @@ mod tests {
             hermes_gateway_url: None,
             hermes_gateway_token: Some("t".into()),
             hermes_dashboard_token: None,
+            mnemosyne_mcp_url: None,
+            mnemosyne_mcp_token: None,
+            mnemosyne_mcp_bank: None,
+            mnemosyne_export_dir: None,
         };
         let err = HermesClient::from_config(&cfg).unwrap_err().to_string();
         assert!(err.contains("HERMES_GATEWAY_URL"));

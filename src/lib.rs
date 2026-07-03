@@ -9,6 +9,7 @@ pub mod executor;
 pub mod hermes;
 pub mod interrupt;
 pub mod lock;
+pub mod mcp;
 pub mod models;
 pub mod notify;
 pub mod redaction;
@@ -49,6 +50,9 @@ pub enum YggError {
 
     #[error("tmux: {0}")]
     Tmux(String),
+
+    #[error("mcp: {0}")]
+    Mcp(String),
 
     #[error("{0}")]
     Other(#[from] anyhow::Error),

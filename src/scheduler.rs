@@ -1423,6 +1423,10 @@ mod tests {
             hermes_gateway_url: None,
             hermes_gateway_token: None,
             hermes_dashboard_token: None,
+            mnemosyne_mcp_url: None,
+            mnemosyne_mcp_token: None,
+            mnemosyne_mcp_bank: None,
+            mnemosyne_export_dir: None,
         };
         unsafe { std::env::remove_var("YGG_SCHEDULER_TICK_MS") };
         unsafe { std::env::remove_var("YGG_SCHEDULER_MAX_CONCURRENT") };

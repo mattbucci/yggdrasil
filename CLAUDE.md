@@ -38,7 +38,13 @@ ygg lock list                               # See outstanding locks
 ygg spawn --task "..."                      # Spawn a parallel agent in a new tmux window
 ygg interrupt take-over --agent <name>      # Take over / steer another agent
 ygg logs --follow                           # Live event stream
+ygg memory search "..."                     # Search the shared mnemosyne memory (add/show/rm/stats/sync too)
+ygg memory sync                             # Snapshot the shared memory + report drift
 ```
+
+Note: `ygg memory` (the mnemosyne MCP layer) is a cross-agent, hosted memory
+service, distinct from `ygg remember` (a local per-repo note store). It needs
+`MNEMOSYNE_MCP_URL` set; see the README "Agent memory (mnemosyne)" section.
 
 ### Rules
 

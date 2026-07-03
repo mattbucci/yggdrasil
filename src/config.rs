@@ -21,6 +21,17 @@ pub struct AppConfig {
     pub hermes_gateway_token: Option<String>,
     /// Separate bearer token for the ops dashboard API (`/dashboard/api/*`).
     pub hermes_dashboard_token: Option<String>,
+    /// SSE URL of the mnemosyne MCP agent-memory service, e.g.
+    /// `http://hermes-gateway.ph.ca:8077/sse`. None disables `ygg memory`.
+    pub mnemosyne_mcp_url: Option<String>,
+    /// Bearer token for the mnemosyne MCP service (loopback may not require it).
+    pub mnemosyne_mcp_token: Option<String>,
+    /// Default memory bank (partition). Falls back to `"default"` per call.
+    pub mnemosyne_mcp_bank: Option<String>,
+    /// Optional host-shared directory readable by both ygg and the mnemosyne
+    /// service. When set it enables server-side `mnemosyne_export`/`import`
+    /// sync; otherwise sync falls back to recall-based enumeration.
+    pub mnemosyne_export_dir: Option<String>,
 }
 
 impl AppConfig {
@@ -60,6 +71,10 @@ impl AppConfig {
             hermes_gateway_url: non_empty_env("HERMES_GATEWAY_URL"),
             hermes_gateway_token: non_empty_env("HERMES_GATEWAY_TOKEN"),
             hermes_dashboard_token: non_empty_env("HERMES_DASHBOARD_TOKEN"),
+            mnemosyne_mcp_url: non_empty_env("MNEMOSYNE_MCP_URL"),
+            mnemosyne_mcp_token: non_empty_env("MNEMOSYNE_MCP_TOKEN"),
+            mnemosyne_mcp_bank: non_empty_env("MNEMOSYNE_MCP_BANK"),
+            mnemosyne_export_dir: non_empty_env("MNEMOSYNE_EXPORT_DIR"),
         })
     }
 }

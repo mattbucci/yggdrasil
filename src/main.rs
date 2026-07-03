@@ -358,6 +358,12 @@ enum Commands {
         #[command(subcommand)]
         action: ygg::cli::hermes_cmd::HermesAction,
     },
+
+    /// Manage and sync the shared agent memory (mnemosyne MCP service)
+    Memory {
+        #[command(subcommand)]
+        action: ygg::cli::memory_cmd::MemoryAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2285,6 +2291,10 @@ async fn main() -> anyhow::Result<()> {
         Commands::Hermes { action } => {
             let config = ygg::config::AppConfig::from_env()?;
             ygg::cli::hermes_cmd::handle(&config, action).await?;
+        }
+        Commands::Memory { action } => {
+            let config = ygg::config::AppConfig::from_env()?;
+            ygg::cli::memory_cmd::handle(&config, action).await?;
         }
     }
 

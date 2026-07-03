@@ -117,6 +117,7 @@ One deliberate design choice: Yggdrasil is **global per user**, not per repo. On
 | `agent-tool`| Hook: record the tool an agent is about to call.                        |
 | `hook`      | Native Claude Code lifecycle hook handlers.                             |
 | `hermes`    | Control/monitor hermes-gateway: `status / agents / submit / tasks / show / output / cancel / rm / health / back`. |
+| `memory`    | Manage/sync the shared agent memory (mnemosyne MCP): `list / search / show / add / update / rm / invalidate / stats / tools / export / import / sync`. |
 
 ### Hermes gateway integration
 
@@ -138,6 +139,43 @@ tmux. Mark a task hermes-backed with `ygg hermes back <task-ref> --agent
 feature-dev` (clear with `--off`); the scheduler then submits it via
 `POST /v1/tasks` and reconciles its terminal state by polling the gateway
 (`YGG_HERMES_POLL_SECS`, default 5). The default backend stays tmux.
+
+### Agent memory (mnemosyne)
+
+`ygg memory` manages the shared agent-memory layer hosted by the **mnemosyne**
+MCP service (see `agent-sandbox/docs/hermes-gateway.md` and
+`docs/adr/0002-agent-memory-hosted-surface.md`). It speaks MCP-over-SSE
+(JSON-RPC 2.0) via the client in `src/mcp.rs` — the tree's first MCP client.
+Point ygg at the service via `~/.config/ygg/.env`:
+
+```
+MNEMOSYNE_MCP_URL=http://hermes-gateway.ph.ca:8077/sse
+MNEMOSYNE_MCP_TOKEN=mnem_...        # bearer (loopback may not require one)
+MNEMOSYNE_MCP_BANK=default          # default bank; override per call with --bank
+MNEMOSYNE_EXPORT_DIR=/shared/dir    # optional; enables server-side export sync
+```
+
+CRUD maps onto the `mnemosyne_*` tools: `list`/`search` (recall), `show` (get),
+`add` (remember), `update`, `rm` (forget), `invalidate`, `stats`, and `tools`
+(introspection). Reads take `--json`; every command takes `--bank`.
+
+**Snapshot / sync** has two modes because `mnemosyne_export`/`import` use
+**server-side** file paths:
+
+* **Shared-host export** (preferred) — when `MNEMOSYNE_EXPORT_DIR` is set to a
+  directory readable by both ygg and the service, `export` calls
+  `mnemosyne_export` into it and copies the native file to the local snapshot
+  dir; `import` places a snapshot back and calls `mnemosyne_import`. Full
+  fidelity. Use when ygg runs on the same host as mnemosyne.
+* **Recall fallback** (host-agnostic) — when the dir is unset, `export`
+  synthesises a snapshot from a broad high-limit `mnemosyne_recall` (there is no
+  list-all-over-the-wire tool, and recall has no offset, so it is a single
+  capped pull), and `import` replays records via `mnemosyne_remember`,
+  de-duplicating by content hash.
+
+Snapshots land in `$XDG_DATA_HOME/ygg/memory-snapshots/<bank>-<utc>.json`.
+`ygg memory sync` exports and reports one-way drift (added/removed/changed by
+id) against the previous snapshot — not a bidirectional merge.
 
 ## Project Layout
 
