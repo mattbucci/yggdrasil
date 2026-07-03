@@ -7,7 +7,6 @@
 
 use crate::cli::task_cmd::resolve_cwd_repo;
 use crate::models::learning::LearningRepo;
-use uuid::Uuid;
 
 pub fn parse_scope_tags(scopes: &[String]) -> Result<serde_json::Value, anyhow::Error> {
     let mut map = serde_json::Map::new();
@@ -46,7 +45,7 @@ pub fn parse_scope_tags(scopes: &[String]) -> Result<serde_json::Value, anyhow::
 /// is `propose`.
 #[allow(clippy::too_many_arguments)]
 pub async fn create(
-    pool: &sqlx::PgPool,
+    pool: &crate::db::DbPool,
     text: &str,
     global: bool,
     file_glob: Option<&str>,
@@ -63,7 +62,7 @@ pub async fn create(
     } else {
         Some(resolve_cwd_repo(pool).await?.repo_id)
     };
-    let created_by: Option<Uuid> =
+    let created_by: Option<String> =
         sqlx::query_scalar("SELECT agent_id FROM agents WHERE agent_name = $1")
             .bind(agent_name)
             .fetch_optional(pool)
@@ -73,7 +72,15 @@ pub async fn create(
 
     let learning = LearningRepo::new(pool)
         .create(
-            repo_id, file_glob, rule_id, text, context, created_by, scope_tags, status, source,
+            repo_id.clone(),
+            file_glob,
+            rule_id,
+            text,
+            context,
+            created_by,
+            scope_tags,
+            status,
+            source,
         )
         .await?;
 
@@ -106,7 +113,7 @@ pub async fn create(
 
 /// `ygg learn pending` — the triage queue (status='pending'), newest first.
 pub async fn pending(
-    pool: &sqlx::PgPool,
+    pool: &crate::db::DbPool,
     all_repos: bool,
     json: bool,
 ) -> Result<(), anyhow::Error> {
@@ -133,7 +140,7 @@ pub async fn pending(
     }
     for r in &rows {
         let scope = format_scope_label(
-            r.repo_id,
+            r.repo_id.clone(),
             r.file_glob.as_deref(),
             r.rule_id.as_deref(),
             &r.scope_tags,
@@ -152,11 +159,11 @@ pub async fn pending(
 
 /// `ygg learn approve <id>` — promote a pending learning to active.
 pub async fn approve(
-    pool: &sqlx::PgPool,
-    learning_id: Uuid,
+    pool: &crate::db::DbPool,
+    learning_id: String,
     agent_name: &str,
 ) -> Result<(), anyhow::Error> {
-    let approver: Option<Uuid> =
+    let approver: Option<String> =
         sqlx::query_scalar("SELECT agent_id FROM agents WHERE agent_name = $1")
             .bind(agent_name)
             .fetch_optional(pool)
@@ -164,7 +171,7 @@ pub async fn approve(
             .ok()
             .flatten();
     match LearningRepo::new(pool)
-        .approve(learning_id, approver)
+        .approve(learning_id.clone(), approver)
         .await?
     {
         Some(l) => {
@@ -190,11 +197,11 @@ pub async fn approve(
 
 /// `ygg learn reject <id>` — drop a pending proposal.
 pub async fn reject(
-    pool: &sqlx::PgPool,
-    learning_id: Uuid,
+    pool: &crate::db::DbPool,
+    learning_id: String,
     reason: Option<&str>,
 ) -> Result<(), anyhow::Error> {
-    if LearningRepo::new(pool).reject(learning_id).await? {
+    if LearningRepo::new(pool).reject(learning_id.clone()).await? {
         match reason {
             Some(r) => println!("rejected {learning_id} — {r}"),
             None => println!("rejected {learning_id}"),
@@ -208,7 +215,7 @@ pub async fn reject(
 }
 
 pub async fn list(
-    pool: &sqlx::PgPool,
+    pool: &crate::db::DbPool,
     file_path: Option<&str>,
     rule_id: Option<&str>,
     all_repos: bool,
@@ -239,7 +246,7 @@ pub async fn list(
     }
     for r in &rows {
         let scope = format_scope_label(
-            r.repo_id,
+            r.repo_id.clone(),
             r.file_glob.as_deref(),
             r.rule_id.as_deref(),
             &r.scope_tags,
@@ -258,8 +265,8 @@ pub async fn list(
     Ok(())
 }
 
-pub async fn delete(pool: &sqlx::PgPool, learning_id: Uuid) -> Result<(), anyhow::Error> {
-    LearningRepo::new(pool).delete(learning_id).await?;
+pub async fn delete(pool: &crate::db::DbPool, learning_id: String) -> Result<(), anyhow::Error> {
+    LearningRepo::new(pool).delete(learning_id.clone()).await?;
     println!("deleted {learning_id}");
     Ok(())
 }
@@ -269,26 +276,26 @@ pub async fn delete(pool: &sqlx::PgPool, learning_id: Uuid) -> Result<(), anyhow
 /// injection. Increments each surfaced learning's `applied_count` so the
 /// usage telemetry reflects real hits, not just creation.
 pub async fn surface_for_files(
-    pool: &sqlx::PgPool,
-    repo_id: Option<Uuid>,
+    pool: &crate::db::DbPool,
+    repo_id: Option<String>,
     files: &[String],
     agent_name: Option<&str>,
     task_kind: Option<&str>,
 ) -> Result<Vec<String>, anyhow::Error> {
     let mut out = Vec::new();
-    let mut seen: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let repo = LearningRepo::new(pool);
 
     for f in files {
         let rows = repo
-            .list_matching(repo_id, Some(f), None, agent_name, task_kind)
+            .list_matching(repo_id.clone(), Some(f), None, agent_name, task_kind)
             .await?;
         for l in rows {
-            if !seen.insert(l.learning_id) {
+            if !seen.insert(l.learning_id.clone()) {
                 continue;
             }
             out.push(format_learning_line(&l));
-            let _ = repo.increment_applied(l.learning_id).await;
+            let _ = repo.increment_applied(l.learning_id.clone()).await;
         }
     }
 
@@ -300,11 +307,11 @@ pub async fn surface_for_files(
             if l.file_glob.is_some() || l.rule_id.is_some() {
                 continue;
             }
-            if !seen.insert(l.learning_id) {
+            if !seen.insert(l.learning_id.clone()) {
                 continue;
             }
             out.push(format_learning_line(&l));
-            let _ = repo.increment_applied(l.learning_id).await;
+            let _ = repo.increment_applied(l.learning_id.clone()).await;
         }
     }
 
@@ -323,7 +330,7 @@ pub async fn surface_for_files(
 /// Best-effort — any DB or filesystem hiccup yields an empty Vec, never an
 /// error to the hook caller.
 pub async fn surface_for_edit(
-    pool: &sqlx::PgPool,
+    pool: &crate::db::DbPool,
     file_path: &str,
     agent_name: Option<&str>,
     session_id: &str,
@@ -376,23 +383,23 @@ pub async fn surface_for_edit(
         }
         out.push(format_learning_line(l));
         fresh.push(id);
-        let _ = repo.increment_applied(l.learning_id).await;
+        let _ = repo.increment_applied(l.learning_id.clone()).await;
     }
 
-    if let Some(p) = seen_path {
-        if !fresh.is_empty() {
-            if let Some(dir) = p.parent() {
-                std::fs::create_dir_all(dir).ok();
-            }
-            use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&p)
-            {
-                for id in &fresh {
-                    let _ = writeln!(f, "{id}");
-                }
+    if let Some(p) = seen_path
+        && !fresh.is_empty()
+    {
+        if let Some(dir) = p.parent() {
+            std::fs::create_dir_all(dir).ok();
+        }
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&p)
+        {
+            for id in &fresh {
+                let _ = writeln!(f, "{id}");
             }
         }
     }
@@ -433,7 +440,7 @@ fn scope_tag_fragments(scope_tags: &serde_json::Value) -> Vec<String> {
 }
 
 fn format_scope_label(
-    repo_id: Option<Uuid>,
+    repo_id: Option<String>,
     file_glob: Option<&str>,
     rule_id: Option<&str>,
     scope_tags: &serde_json::Value,
@@ -455,7 +462,7 @@ fn format_scope_label(
 
 fn format_learning_line(l: &crate::models::learning::Learning) -> String {
     let scope = format_scope_label(
-        l.repo_id,
+        l.repo_id.clone(),
         l.file_glob.as_deref(),
         l.rule_id.as_deref(),
         &l.scope_tags,
@@ -473,6 +480,7 @@ fn short(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uuid::Uuid;
 
     #[test]
     fn extracts_common_paths() {
@@ -557,7 +565,7 @@ mod tests {
     #[test]
     fn scope_label_with_tags() {
         let label = format_scope_label(
-            Some(Uuid::nil()),
+            Some(Uuid::nil().to_string()),
             Some("src/*.rs"),
             None,
             &serde_json::json!({"agent": "foo", "kind": "bug"}),

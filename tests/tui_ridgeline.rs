@@ -52,7 +52,7 @@ fn quality_class_strong_when_top_band_dominates() {
 #[test]
 fn quality_class_weak_when_top_band_empty() {
     // No high-band hits → Weak.
-    let r = bin_ridge("q", &vec![0.30; 10]);
+    let r = bin_ridge("q", &[0.30; 10]);
     assert_eq!(quality_class(&r), RidgeQuality::Weak);
 }
 

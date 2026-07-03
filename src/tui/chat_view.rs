@@ -12,17 +12,16 @@
 //! - **Unread count**: tracks messages seen while the view is active;
 //!   `unread_count()` reports unseen messages for tab badges.
 
+use crate::db::DbPool;
 use chrono::{DateTime, Utc};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
-use sqlx::PgPool;
-use uuid::Uuid;
 
 use crate::cli::msg_cmd;
 
 #[derive(Debug, Clone)]
 struct ChatMsg {
-    id: Uuid,
+    id: String,
     from_name: String,
     to_name: Option<String>,
     body: String,
@@ -36,7 +35,7 @@ pub struct ChatView {
     pub compose: Option<ComposeState>,
     pub flash: Option<String>,
     /// UUID of the message shown in the detail overlay (Enter on directed msg).
-    detail: Option<Uuid>,
+    detail: Option<String>,
     /// Active filter string — when `Some`, only matching messages are shown.
     filter: Option<String>,
     /// True when the filter input line is focused (typing mode).
@@ -47,6 +46,12 @@ pub struct ChatView {
 
 pub struct ComposeState {
     pub buf: String,
+}
+
+impl Default for ChatView {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ChatView {
@@ -89,7 +94,7 @@ impl ChatView {
     }
 
     /// Parse compose buffer and send. `@agent rest` = directed; plain text = broadcast.
-    pub async fn compose_commit(&mut self, pool: &PgPool, from_agent: &str) {
+    pub async fn compose_commit(&mut self, pool: &DbPool, from_agent: &str) {
         let Some(cs) = self.compose.take() else {
             return;
         };
@@ -136,12 +141,11 @@ impl ChatView {
             return;
         };
         let indices = self.visible_indices();
-        if let Some(&real) = indices.get(idx) {
-            if let Some(msg) = self.messages.get(real) {
-                if msg.to_name.is_some() {
-                    self.detail = Some(msg.id);
-                }
-            }
+        if let Some(&real) = indices.get(idx)
+            && let Some(msg) = self.messages.get(real)
+            && msg.to_name.is_some()
+        {
+            self.detail = Some(msg.id.clone());
         }
     }
 
@@ -179,7 +183,7 @@ impl ChatView {
     /// Stop editing the filter. If the text is empty, clear the filter entirely.
     pub fn filter_accept(&mut self) {
         self.filter_editing = false;
-        if self.filter.as_ref().map_or(true, |f| f.is_empty()) {
+        if self.filter.as_ref().is_none_or(|f| f.is_empty()) {
             self.filter = None;
         }
         // Reset selection to stay in bounds of the now-visible list.
@@ -213,7 +217,7 @@ impl ChatView {
     // ── claim / scroll / refresh ────────────────────────────────────
 
     /// Claim the selected broadcast message.
-    pub async fn claim_selected(&mut self, pool: &PgPool, agent_name: &str) {
+    pub async fn claim_selected(&mut self, pool: &DbPool, agent_name: &str) {
         let Some(idx) = self.state.selected() else {
             return;
         };
@@ -228,7 +232,7 @@ impl ChatView {
             self.flash = Some("not a broadcast — already directed".into());
             return;
         }
-        match msg_cmd::claim_broadcast(pool, msg.id, agent_name).await {
+        match msg_cmd::claim_broadcast(pool, msg.id.clone(), agent_name).await {
             Ok(()) => self.flash = Some(format!("claimed by {agent_name}")),
             Err(e) => self.flash = Some(format!("claim failed: {e}")),
         }
@@ -247,7 +251,7 @@ impl ChatView {
         self.state.select(Some(i.saturating_sub(1)));
     }
 
-    pub async fn refresh(&mut self, pool: &PgPool) -> Result<(), anyhow::Error> {
+    pub async fn refresh(&mut self, pool: &DbPool) -> Result<(), anyhow::Error> {
         self.loaded = true;
         let msgs = msg_cmd::all_messages(pool, 24, 200).await?;
         self.messages = msgs
@@ -388,7 +392,11 @@ impl ChatView {
     }
 
     fn render_detail_overlay(&self, frame: &mut Frame, area: Rect) {
-        let Some(msg) = self.messages.iter().find(|m| self.detail == Some(m.id)) else {
+        let Some(msg) = self
+            .messages
+            .iter()
+            .find(|m| self.detail == Some(m.id.clone()))
+        else {
             return;
         };
 
@@ -462,7 +470,7 @@ impl ChatView {
                         m.from_name.to_lowercase().contains(&needle)
                             || m.to_name
                                 .as_ref()
-                                .map_or(false, |t| t.to_lowercase().contains(&needle))
+                                .is_some_and(|t| t.to_lowercase().contains(&needle))
                             || m.body.to_lowercase().contains(&needle)
                     })
                     .collect()

@@ -12,9 +12,8 @@
 //! "anything I need to do", this tab is the punch list. The numeric
 //! badge on the tab title = sum of the three counts.
 
+use crate::db::DbPool;
 use chrono::{DateTime, Utc};
-use sqlx::PgPool;
-use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttentionKind {
@@ -23,7 +22,7 @@ pub enum AttentionKind {
     AgentWaitingTool { agent: String, idle_secs: i64 },
     /// Run is parked behind an approval gate (approve_plan or
     /// approve_completion).
-    RunAwaitingReview { task_ref: String, run_id: Uuid },
+    RunAwaitingReview { task_ref: String, run_id: String },
     /// Run has been nudged ≥ 2 times — likely a recover-loop the
     /// scheduler can't break alone.
     RunRepeatedlyNudged { task_ref: String, nudges: i32 },
@@ -46,17 +45,17 @@ pub const NUDGE_THRESHOLD: i32 = 2;
 /// Single roundtrip that pulls all three categories. Cheap enough for
 /// the existing 500ms refresh tick; the queries are bounded (each
 /// LIMIT 50) so a runaway dataset can't pin the TUI.
-pub async fn fetch_attention_items(pool: &PgPool) -> Result<Vec<AttentionItem>, sqlx::Error> {
+pub async fn fetch_attention_items(pool: &DbPool) -> Result<Vec<AttentionItem>, sqlx::Error> {
     let mut out: Vec<AttentionItem> = Vec::new();
 
     // (1) Tool-waiting agents, idle longer than the threshold.
     let waiting: Vec<(String, DateTime<Utc>, i64)> = sqlx::query_as(
         r#"SELECT agent_name, updated_at,
-                  EXTRACT(EPOCH FROM (now() - updated_at))::bigint AS idle_secs
+                  CAST((julianday('now') - julianday(updated_at)) * 86400 AS INTEGER) AS idle_secs
              FROM agents
             WHERE archived_at IS NULL
               AND current_state = 'waiting_tool'
-              AND updated_at < now() - make_interval(secs => $1)
+              AND updated_at < strftime('%Y-%m-%dT%H:%M:%f+00:00','now','-' || $1 || ' seconds')
             ORDER BY updated_at ASC
             LIMIT 50"#,
     )
@@ -75,7 +74,7 @@ pub async fn fetch_attention_items(pool: &PgPool) -> Result<Vec<AttentionItem>, 
 
     // (2) Runs awaiting review — approve_plan / approve_completion
     // gates encoded as task.approval_level + tasks.approved_at NULL.
-    let awaiting: Vec<(Uuid, String, i32, DateTime<Utc>)> = sqlx::query_as(
+    let awaiting: Vec<(String, String, i32, DateTime<Utc>)> = sqlx::query_as(
         r#"SELECT tr.run_id, r.task_prefix, t.seq, COALESCE(tr.scheduled_at, t.updated_at)
              FROM task_runs tr
              JOIN tasks t ON t.task_id = tr.task_id

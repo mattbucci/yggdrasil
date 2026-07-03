@@ -4,11 +4,11 @@
 //! default) — these aren't liveness signals, they're "why is the system
 //! slow / how big has the corpus grown."
 
+use crate::db::DbPool;
 use chrono::{DateTime, Utc};
 use ratatui::layout::Rect;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph, Sparkline};
-use sqlx::PgPool;
 
 use super::app::{OpsStats, cost_hidden, format_tokens_per_min};
 
@@ -106,15 +106,15 @@ impl NerdyView {
         self.ops = ops.clone();
     }
 
-    pub async fn refresh(&mut self, pool: &PgPool) -> Result<(), anyhow::Error> {
+    pub async fn refresh(&mut self, pool: &DbPool) -> Result<(), anyhow::Error> {
         self.stats = collect(pool).await;
 
         // Events-per-hour sparkline — 24 buckets.
         let rows: Vec<(i32, i64)> = sqlx::query_as(
-            "SELECT (24 - FLOOR(EXTRACT(EPOCH FROM (now() - created_at)) / 3600))::int,
+            "SELECT (24 - CAST((julianday('now') - julianday(created_at)) * 24 AS INTEGER)),
                     COUNT(*)
              FROM events
-             WHERE created_at >= now() - interval '24 hours'
+             WHERE created_at >= strftime('%Y-%m-%dT%H:%M:%f+00:00','now','-24 hours')
              GROUP BY 1 ORDER BY 1",
         )
         .fetch_all(pool)
@@ -132,16 +132,16 @@ impl NerdyView {
         let mut bars: Vec<(String, i64, i64)> = Vec::new();
         if let Ok(agents) = AgentRepo::new(pool, crate::db::user_id()).list().await {
             // DB totals as fallback when live transcript isn't parseable.
-            let db_totals: Vec<(uuid::Uuid, i64, i64)> = sqlx::query_as(
+            let db_totals: Vec<(String, i64, i64)> = sqlx::query_as(
                 "SELECT agent_id,
-                        COALESCE(SUM(input_tokens + output_tokens + cache_read + cache_write), 0)::bigint,
-                        COALESCE(SUM(output_tokens), 0)::bigint
+                        COALESCE(SUM(input_tokens + output_tokens + cache_read + cache_write), 0),
+                        COALESCE(SUM(output_tokens), 0)
                  FROM agent_stats GROUP BY 1",
             )
             .fetch_all(pool)
             .await
             .unwrap_or_default();
-            let db_map: std::collections::HashMap<uuid::Uuid, i64> = db_totals
+            let db_map: std::collections::HashMap<String, i64> = db_totals
                 .into_iter()
                 .map(|(id, total, _)| (id, total))
                 .collect();
@@ -149,10 +149,10 @@ impl NerdyView {
             for a in &agents {
                 if let Some(b) = agent_usage_breakdown(&a.agent_name) {
                     bars.push((a.agent_name.clone(), b.total(), b.hard_cap));
-                } else if let Some(&total) = db_map.get(&a.agent_id) {
-                    if total > 0 {
-                        bars.push((a.agent_name.clone(), total, HARD_DANGER));
-                    }
+                } else if let Some(&total) = db_map.get(&a.agent_id)
+                    && total > 0
+                {
+                    bars.push((a.agent_name.clone(), total, HARD_DANGER));
                 }
             }
         }
@@ -388,7 +388,7 @@ impl NerdyView {
     }
 }
 
-async fn collect(pool: &PgPool) -> NerdyStats {
+async fn collect(pool: &DbPool) -> NerdyStats {
     let mut out = NerdyStats {
         loaded: true,
         ..Default::default()
@@ -436,58 +436,60 @@ async fn collect(pool: &PgPool) -> NerdyStats {
         out.tokens = ts;
     }
 
-    // Table sizes — pg_total_relation_size() per known orchestrator
-    // table; deduplicated by joining pg_stat_user_tables for dead-tuple
-    // ratio. Limited to the tables we care about so a sprawling DB
-    // doesn't pollute the view.
-    let table_query = r#"
-        WITH wanted AS (
-          SELECT unnest(ARRAY[
-            'tasks', 'task_runs', 'events',
-            'agent_stats', 'learnings',
-            'task_deps', 'locks'
-          ]) AS name
-        )
-        SELECT
-          w.name,
-          COALESCE(s.n_live_tup, 0)::bigint  AS rows,
-          COALESCE(pg_total_relation_size(w.name::regclass), 0)::bigint AS bytes,
-          CASE WHEN COALESCE(s.n_live_tup, 0) > 0
-               THEN (COALESCE(s.n_dead_tup, 0)::float / s.n_live_tup::float)
-               ELSE 0.0
-          END AS dead_ratio
-        FROM wanted w
-        LEFT JOIN pg_stat_user_tables s
-          ON s.relname = w.name AND s.schemaname = 'public'
-        WHERE EXISTS (
-          SELECT 1 FROM pg_class c WHERE c.relname = w.name
-        )
-        ORDER BY bytes DESC
-    "#;
-    if let Ok(rows) = sqlx::query_as::<_, (String, i64, i64, f64)>(table_query)
-        .fetch_all(pool)
-        .await
-    {
-        out.tables = rows
-            .into_iter()
-            .map(|(name, rows, bytes, dead_ratio)| TableStat {
-                name,
-                rows,
-                bytes,
-                dead_ratio,
-            })
-            .collect();
+    // Table sizes — SQLite has no per-table size catalog without the
+    // dbstat vtab, so report row counts for the tables we care about and
+    // approximate bytes as the table's share of the database file.
+    // dead_ratio has no SQLite equivalent (no vacuum bloat catalog) — 0.0.
+    let table_names = [
+        "tasks",
+        "task_runs",
+        "events",
+        "agent_stats",
+        "learnings",
+        "task_deps",
+        "locks",
+    ];
+    let db_bytes: i64 = sqlx::query_scalar(
+        "SELECT (SELECT page_count FROM pragma_page_count()) *
+                (SELECT page_size FROM pragma_page_size())",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0);
+    let mut table_rows: Vec<(String, i64)> = Vec::new();
+    let mut total_rows: i64 = 0;
+    for name in table_names {
+        let n: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {name}"))
+            .fetch_one(pool)
+            .await
+            .unwrap_or(0);
+        total_rows += n;
+        table_rows.push((name.to_string(), n));
     }
+    table_rows.sort_by(|a, b| b.1.cmp(&a.1));
+    out.tables = table_rows
+        .into_iter()
+        .map(|(name, rows)| TableStat {
+            name,
+            rows,
+            bytes: if total_rows > 0 {
+                (db_bytes as f64 * rows as f64 / total_rows as f64) as i64
+            } else {
+                0
+            },
+            dead_ratio: 0.0,
+        })
+        .collect();
 
     // Hooks — last fire + 24h count per hook_fired payload kind.
     let hook_q = r#"
         SELECT
           payload->>'hook' AS kind,
           MAX(created_at)  AS last_fired,
-          COUNT(*) FILTER (WHERE created_at > now() - interval '24 hours')::bigint AS count_24h
+          COUNT(*) FILTER (WHERE created_at > strftime('%Y-%m-%dT%H:%M:%f+00:00','now','-24 hours')) AS count_24h
         FROM events
         WHERE event_kind = 'hook_fired'
-          AND payload ? 'hook'
+          AND json_extract(payload, '$.hook') IS NOT NULL
         GROUP BY payload->>'hook'
         ORDER BY MAX(created_at) DESC NULLS LAST
         LIMIT 20

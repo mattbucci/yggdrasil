@@ -1,4 +1,4 @@
-use sqlx::PgPool;
+use crate::db::DbPool;
 use std::process::Command;
 use std::time::Duration;
 
@@ -11,12 +11,12 @@ use crate::tmux::TmuxManager;
 /// Background watcher daemon.
 /// Periodically: reap expired locks, flag stale agents, cleanup.
 pub struct Watcher {
-    pool: PgPool,
+    pool: DbPool,
     config: AppConfig,
 }
 
 impl Watcher {
-    pub fn new(pool: PgPool, config: AppConfig) -> Self {
+    pub fn new(pool: DbPool, config: AppConfig) -> Self {
         Self { pool, config }
     }
 
@@ -89,7 +89,7 @@ impl Watcher {
                 WHERE state IN ('completed', 'failed')
                   AND (branch_pushed = false OR branch_merged = false)
                   AND (delivery_checked_at IS NULL
-                       OR delivery_checked_at < now() - interval '60 seconds')
+                       OR delivery_checked_at < strftime('%Y-%m-%dT%H:%M:%f+00:00','now','-60 seconds'))
                 ORDER BY ended_at DESC NULLS LAST
                 LIMIT 20"#,
         )
@@ -104,7 +104,7 @@ impl Watcher {
             let branch = derive_branch(&w.tmux_window);
             let (pushed, merged, pr) = inspect_delivery(&w.worktree_path, branch.as_deref());
             let _ = repo
-                .set_delivery(w.worker_id, pushed, merged, pr.as_deref())
+                .set_delivery(&w.worker_id, pushed, merged, pr.as_deref())
                 .await;
             if pushed != w.branch_pushed || merged != w.branch_merged {
                 n += 1;
@@ -148,7 +148,7 @@ impl Watcher {
                     // claude exited and the shell closed.
                     let _ = repo
                         .set_state(
-                            w.worker_id,
+                            &w.worker_id,
                             WorkerState::Abandoned,
                             Some("tmux window absent on observer tick"),
                         )
@@ -158,16 +158,16 @@ impl Watcher {
                 }
 
                 // Touch last_seen_at; then inspect the pane for prompts.
-                let _ = repo.touch(w.worker_id).await;
+                let _ = repo.touch(&w.worker_id).await;
                 let pane = capture_pane(&session, &w.tmux_window).unwrap_or_default();
                 let next = classify_pane(&pane);
                 if next != w.state {
-                    let _ = repo.set_state(w.worker_id, next, None).await;
+                    let _ = repo.set_state(&w.worker_id, next, None).await;
                     changes += 1;
                 }
                 let intent = extract_intent(&pane, next);
                 if intent.as_deref() != w.intent.as_deref() {
-                    let _ = repo.set_intent(w.worker_id, intent.as_deref()).await;
+                    let _ = repo.set_intent(&w.worker_id, intent.as_deref()).await;
                 }
             }
         }
@@ -201,7 +201,7 @@ impl Watcher {
             FROM agents
             WHERE archived_at IS NULL
               AND current_state IN ('executing', 'waiting_tool', 'planning', 'context_flush')
-              AND updated_at < now() - make_interval(secs => $1)
+              AND updated_at < strftime('%Y-%m-%dT%H:%M:%f+00:00','now','-' || $1 || ' seconds')
             "#,
         )
         .bind(stale_threshold as f64)
@@ -296,10 +296,14 @@ impl Watcher {
                 continue;
             }
 
-            let _ = session_repo.end_all_for_agent(a.agent_id).await;
-            let _ = lock_mgr.release_all_for_agent(a.agent_id).await;
+            let _ = session_repo.end_all_for_agent(&a.agent_id).await;
+            let _ = lock_mgr.release_all_for_agent(&a.agent_id).await;
             let _ = agent_repo
-                .force_state(a.agent_id, crate::models::agent::AgentState::Shutdown, None)
+                .force_state(
+                    &a.agent_id,
+                    crate::models::agent::AgentState::Shutdown,
+                    None,
+                )
                 .await;
             // Killing the window is mostly a no-op (it's already gone) but
             // covers the rare case where tmux still has a stub window with
@@ -308,16 +312,16 @@ impl Watcher {
             // Checkpoint work-in-progress onto refs/ygg/recovery/<run_id> before
             // we destroy the worktree, so the retry can continue from it rather
             // than reset to the starting commit (yggdrasil-115).
-            if let Some(run_id) = latest_run_for_agent(&self.pool, a.agent_id).await {
-                if let Some(sha) = crate::worktree::checkpoint(&worktree, run_id) {
-                    record_pre_recovery_commit(&self.pool, run_id, &sha).await;
-                    tracing::info!(
-                        agent = %a.agent_name,
-                        run = %run_id,
-                        sha = %sha,
-                        "pre-recovery checkpoint"
-                    );
-                }
+            if let Some(run_id) = latest_run_for_agent(&self.pool, &a.agent_id).await
+                && let Some(sha) = crate::worktree::checkpoint(&worktree, run_id.clone())
+            {
+                record_pre_recovery_commit(&self.pool, &run_id, &sha).await;
+                tracing::info!(
+                    agent = %a.agent_name,
+                    run = %run_id,
+                    sha = %sha,
+                    "pre-recovery checkpoint"
+                );
             }
             let worktree_str = worktree.to_string_lossy();
             remove_worktree(&worktree_str);
@@ -576,7 +580,7 @@ fn repo_toplevel() -> Option<std::path::PathBuf> {
 
 /// The most recent run bound to an agent — the one whose worktree we're about
 /// to reap. Returns None if the agent never bound to a run.
-async fn latest_run_for_agent(pool: &PgPool, agent_id: uuid::Uuid) -> Option<uuid::Uuid> {
+async fn latest_run_for_agent(pool: &DbPool, agent_id: &str) -> Option<String> {
     sqlx::query_scalar(
         "SELECT run_id FROM task_runs WHERE agent_id = $1
           ORDER BY started_at DESC NULLS LAST, created_at DESC LIMIT 1",
@@ -588,9 +592,9 @@ async fn latest_run_for_agent(pool: &PgPool, agent_id: uuid::Uuid) -> Option<uui
     .flatten()
 }
 
-async fn record_pre_recovery_commit(pool: &PgPool, run_id: uuid::Uuid, sha: &str) {
+async fn record_pre_recovery_commit(pool: &DbPool, run_id: &str, sha: &str) {
     let _ = sqlx::query(
-        "UPDATE task_runs SET pre_recovery_commit = $2, updated_at = now() WHERE run_id = $1",
+        "UPDATE task_runs SET pre_recovery_commit = $2, updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now') WHERE run_id = $1",
     )
     .bind(run_id)
     .bind(sha)

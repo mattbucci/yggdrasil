@@ -6,7 +6,7 @@ use ygg::tui::constellation::{AgentEdge, AgentNode, cluster_of, relax};
 
 fn node(label: &str, x: f32, y: f32) -> AgentNode {
     AgentNode {
-        agent_id: Uuid::new_v4(),
+        agent_id: Uuid::new_v4().to_string(),
         label: label.into(),
         x,
         y,
@@ -15,7 +15,7 @@ fn node(label: &str, x: f32, y: f32) -> AgentNode {
     }
 }
 
-fn edge(from: Uuid, to: Uuid) -> AgentEdge {
+fn edge(from: String, to: String) -> AgentEdge {
     AgentEdge {
         from,
         to,
@@ -68,11 +68,14 @@ fn cluster_of_groups_connected_nodes_under_one_root() {
     let b = node("b", 0.5, 0.5);
     let c = node("c", 1.0, 1.0);
     let nodes = vec![a.clone(), b.clone(), c.clone()];
-    let edges = vec![edge(a.agent_id, b.agent_id), edge(b.agent_id, c.agent_id)];
+    let edges = vec![
+        edge(a.agent_id.clone(), b.agent_id.clone()),
+        edge(b.agent_id.clone(), c.agent_id.clone()),
+    ];
     let parents = cluster_of(&nodes, &edges);
-    let ra = parents[&a.agent_id];
-    let rb = parents[&b.agent_id];
-    let rc = parents[&c.agent_id];
+    let ra = &parents[&a.agent_id].clone();
+    let rb = &parents[&b.agent_id].clone();
+    let rc = &parents[&c.agent_id].clone();
     assert_eq!(ra, rb);
     assert_eq!(rb, rc);
 }
@@ -85,7 +88,10 @@ fn cluster_of_keeps_disconnected_components_separate() {
     let d = node("d", 0.2, 0.7);
     let nodes = vec![a.clone(), b.clone(), c.clone(), d.clone()];
     // a-b in one component, c-d in another.
-    let edges = vec![edge(a.agent_id, b.agent_id), edge(c.agent_id, d.agent_id)];
+    let edges = vec![
+        edge(a.agent_id.clone(), b.agent_id.clone()),
+        edge(c.agent_id.clone(), d.agent_id.clone()),
+    ];
     let parents = cluster_of(&nodes, &edges);
     assert_eq!(parents[&a.agent_id], parents[&b.agent_id]);
     assert_eq!(parents[&c.agent_id], parents[&d.agent_id]);

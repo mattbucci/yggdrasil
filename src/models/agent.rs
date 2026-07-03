@@ -1,7 +1,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, PgPool};
-use uuid::Uuid;
+use sqlx::FromRow;
+
+use crate::db::DbPool;
 
 #[derive(Debug, Clone, PartialEq, sqlx::Type, Serialize, Deserialize)]
 #[sqlx(type_name = "agent_state", rename_all = "snake_case")]
@@ -35,7 +36,7 @@ impl std::fmt::Display for AgentState {
 
 #[derive(Debug, Clone, Serialize, FromRow)]
 pub struct AgentWorkflow {
-    pub agent_id: Uuid,
+    pub agent_id: String,
     pub agent_name: String,
     pub current_state: AgentState,
     pub context_tokens: i32,
@@ -59,12 +60,12 @@ impl AgentWorkflow {
 }
 
 pub struct AgentRepo<'a> {
-    pool: &'a PgPool,
+    pool: &'a DbPool,
     user_id: String,
 }
 
 impl<'a> AgentRepo<'a> {
-    pub fn new(pool: &'a PgPool, user_id: &str) -> Self {
+    pub fn new(pool: &'a DbPool, user_id: &str) -> Self {
         Self {
             pool,
             user_id: user_id.to_string(),
@@ -86,7 +87,7 @@ impl<'a> AgentRepo<'a> {
             INSERT INTO agents (agent_name, persona, user_id)
             VALUES ($1, $2, $3)
             ON CONFLICT (user_id, agent_name, COALESCE(persona, ''))
-              DO UPDATE SET updated_at = now()
+              DO UPDATE SET updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now')
             RETURNING agent_id, agent_name, current_state,
                       context_tokens, metadata, created_at, updated_at, persona
             "#,
@@ -101,15 +102,15 @@ impl<'a> AgentRepo<'a> {
     /// Transition agent state with optimistic concurrency control.
     pub async fn transition(
         &self,
-        agent_id: Uuid,
+        agent_id: &str,
         from: AgentState,
         to: AgentState,
     ) -> Result<Option<AgentWorkflow>, sqlx::Error> {
         sqlx::query_as::<_, AgentWorkflow>(
             r#"
             UPDATE agents
-            SET current_state = $3::agent_state, updated_at = now()
-            WHERE agent_id = $1 AND current_state = $2::agent_state
+            SET current_state = $3, updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now')
+            WHERE agent_id = $1 AND current_state = $2
             RETURNING agent_id, agent_name, current_state,
                       context_tokens, metadata, created_at, updated_at, persona
             "#,
@@ -128,7 +129,7 @@ impl<'a> AgentRepo<'a> {
     /// dashboard timeline can render transitions.
     pub async fn force_state(
         &self,
-        agent_id: Uuid,
+        agent_id: &str,
         to: AgentState,
         last_tool: Option<&str>,
     ) -> Result<(), sqlx::Error> {
@@ -136,34 +137,41 @@ impl<'a> AgentRepo<'a> {
             Some(t) => serde_json::json!({"last_tool": t}),
             None => serde_json::json!({"last_tool": null}),
         };
-        let row: Option<(AgentState, String)> = sqlx::query_as(
-            r#"
-            WITH prior AS (
-                SELECT current_state AS old_state, agent_name FROM agents WHERE agent_id = $1
+        // SQLite's RETURNING clause cannot contain subqueries, so read the
+        // prior state first, then update. Single-writer CLI: the tiny window
+        // between the two statements is harmless (worst case a duplicate
+        // state-changed event).
+        let row: Option<(AgentState, String)> =
+            sqlx::query_as("SELECT current_state, agent_name FROM agents WHERE agent_id = $1")
+                .bind(agent_id)
+                .fetch_optional(self.pool)
+                .await?;
+        if row.is_some() {
+            sqlx::query(
+                r#"
+                UPDATE agents
+                   SET current_state = $2,
+                       metadata = json_patch(metadata, $3),
+                       updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now')
+                 WHERE agent_id = $1
+                "#,
             )
-            UPDATE agents
-               SET current_state = $2::agent_state,
-                   metadata = metadata || $3::jsonb,
-                   updated_at = now()
-             WHERE agent_id = $1
-             RETURNING (SELECT old_state FROM prior) AS old_state,
-                       (SELECT agent_name FROM prior) AS agent_name
-            "#,
-        )
-        .bind(agent_id)
-        .bind(&to)
-        .bind(meta_patch)
-        .fetch_optional(self.pool)
-        .await?;
+            .bind(agent_id)
+            .bind(&to)
+            .bind(meta_patch)
+            .execute(self.pool)
+            .await?;
+        }
 
-        if let Some((old, name)) = row {
-            if old != to {
-                let payload = serde_json::json!({
-                    "from": old.to_string(),
-                    "to": to.to_string(),
-                    "tool": last_tool,
-                });
-                let _ = sqlx::query(
+        if let Some((old, name)) = row
+            && old != to
+        {
+            let payload = serde_json::json!({
+                "from": old.to_string(),
+                "to": to.to_string(),
+                "tool": last_tool,
+            });
+            let _ = sqlx::query(
                     "INSERT INTO events (event_kind, agent_id, agent_name, payload, cc_session_id, user_id)
                      VALUES ('agent_state_changed', $1, $2, $3, $4, $5)",
                 )
@@ -174,13 +182,12 @@ impl<'a> AgentRepo<'a> {
                 .bind(&self.user_id)
                 .execute(self.pool)
                 .await;
-            }
         }
         Ok(())
     }
 
     /// Get agent by ID.
-    pub async fn get(&self, agent_id: Uuid) -> Result<Option<AgentWorkflow>, sqlx::Error> {
+    pub async fn get(&self, agent_id: &str) -> Result<Option<AgentWorkflow>, sqlx::Error> {
         sqlx::query_as::<_, AgentWorkflow>(
             r#"
             SELECT agent_id, agent_name, current_state,
@@ -275,16 +282,16 @@ impl<'a> AgentRepo<'a> {
         .await
     }
 
-    pub async fn archive(&self, agent_id: Uuid) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE agents SET archived_at = now() WHERE agent_id = $1")
+    pub async fn archive(&self, agent_id: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE agents SET archived_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now') WHERE agent_id = $1")
             .bind(agent_id)
             .execute(self.pool)
             .await?;
         Ok(())
     }
 
-    pub async fn rename(&self, agent_id: Uuid, new_name: &str) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE agents SET agent_name = $2, updated_at = now() WHERE agent_id = $1")
+    pub async fn rename(&self, agent_id: &str, new_name: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE agents SET agent_name = $2, updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now') WHERE agent_id = $1")
             .bind(agent_id)
             .bind(new_name)
             .execute(self.pool)
@@ -295,19 +302,19 @@ impl<'a> AgentRepo<'a> {
     pub async fn list_orphan_candidates(
         &self,
         min_idle_secs: i64,
-    ) -> Result<Vec<(Uuid, String, String)>, sqlx::Error> {
-        sqlx::query_as::<_, (Uuid, String, String)>(
+    ) -> Result<Vec<(String, String, String)>, sqlx::Error> {
+        sqlx::query_as::<_, (String, String, String)>(
             r#"
-            SELECT DISTINCT ON (a.agent_id)
-                   a.agent_id, a.agent_name, w.worktree_path
+            SELECT a.agent_id, a.agent_name, w.worktree_path, MAX(w.started_at)
             FROM agents a
             JOIN tasks t   ON t.assignee = a.agent_id
             JOIN workers w ON w.task_id = t.task_id
             WHERE a.archived_at IS NULL
               AND a.user_id = $2
               AND w.worktree_path <> ''
-              AND a.updated_at < now() - make_interval(secs => $1)
-            ORDER BY a.agent_id, w.started_at DESC
+              AND a.updated_at < strftime('%Y-%m-%dT%H:%M:%f+00:00','now','-' || $1 || ' seconds')
+            GROUP BY a.agent_id
+            ORDER BY a.agent_id
             "#,
         )
         .bind(min_idle_secs)
@@ -316,7 +323,7 @@ impl<'a> AgentRepo<'a> {
         .await
     }
 
-    pub async fn unarchive(&self, agent_id: Uuid) -> Result<(), sqlx::Error> {
+    pub async fn unarchive(&self, agent_id: &str) -> Result<(), sqlx::Error> {
         sqlx::query("UPDATE agents SET archived_at = NULL WHERE agent_id = $1")
             .bind(agent_id)
             .execute(self.pool)
@@ -332,21 +339,21 @@ impl<'a> AgentRepo<'a> {
             FROM agents a
             WHERE a.archived_at IS NULL
               AND a.user_id = $2
-              AND a.updated_at < now() - ($1 || ' days')::interval
+              AND a.updated_at < strftime('%Y-%m-%dT%H:%M:%f+00:00','now','-' || $1 || ' days')
               AND NOT EXISTS (
                     SELECT 1 FROM events e
                      WHERE e.agent_id = a.agent_id
-                       AND e.created_at >= now() - ($1 || ' days')::interval
+                       AND e.created_at >= strftime('%Y-%m-%dT%H:%M:%f+00:00','now','-' || $1 || ' days')
               )
               AND NOT EXISTS (
                     SELECT 1 FROM sessions s
                      WHERE s.agent_id = a.agent_id
                        AND COALESCE(s.ended_at, s.started_at)
-                            >= now() - ($1 || ' days')::interval
+                            >= strftime('%Y-%m-%dT%H:%M:%f+00:00','now','-' || $1 || ' days')
               )
               AND NOT EXISTS (
                     SELECT 1 FROM locks l
-                     WHERE l.agent_id = a.agent_id AND l.expires_at > now()
+                     WHERE l.agent_id = a.agent_id AND l.expires_at > strftime('%Y-%m-%dT%H:%M:%f+00:00','now')
               )
             ORDER BY a.updated_at
             "#,
@@ -364,7 +371,7 @@ impl<'a> AgentRepo<'a> {
                    context_tokens, metadata, created_at, updated_at, persona
             FROM agents
             WHERE current_state IN ('executing', 'waiting_tool', 'planning', 'context_flush')
-              AND updated_at < now() - make_interval(secs => $1)
+              AND updated_at < strftime('%Y-%m-%dT%H:%M:%f+00:00','now','-' || $1 || ' seconds')
               AND user_id = $2
             ORDER BY updated_at
             "#,
@@ -376,9 +383,9 @@ impl<'a> AgentRepo<'a> {
     }
 
     /// Reset an orphaned agent to Idle for resume.
-    pub async fn reset_to_idle(&self, agent_id: Uuid) -> Result<(), sqlx::Error> {
+    pub async fn reset_to_idle(&self, agent_id: &str) -> Result<(), sqlx::Error> {
         sqlx::query(
-            "UPDATE agents SET current_state = 'idle', updated_at = now() WHERE agent_id = $1",
+            "UPDATE agents SET current_state = 'idle', updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now') WHERE agent_id = $1",
         )
         .bind(agent_id)
         .execute(self.pool)
@@ -401,7 +408,7 @@ impl<'a> AgentRepo<'a> {
               FROM agents
              WHERE archived_at IS NULL
                AND current_state NOT IN ('shutdown', 'human_override', 'error')
-               AND updated_at < now() - make_interval(secs => $1)
+               AND updated_at < strftime('%Y-%m-%dT%H:%M:%f+00:00','now','-' || $1 || ' seconds')
             "#,
         )
         .bind(min_idle_secs as f64)

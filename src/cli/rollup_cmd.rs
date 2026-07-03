@@ -4,8 +4,8 @@
 //! it to a file or into a weekly review doc. JSON output is there for
 //! tooling; plain-text for quick terminal reads.
 
+use crate::db::DbPool;
 use chrono::{DateTime, Duration, Utc};
-use sqlx::PgPool;
 
 use crate::models::repo::{Repo, RepoRepo};
 
@@ -17,7 +17,7 @@ pub enum Format {
 }
 
 pub async fn execute(
-    pool: &PgPool,
+    pool: &DbPool,
     days: i64,
     repo_filter: Option<&str>,
     format: Format,
@@ -74,16 +74,16 @@ struct TaskRow {
 }
 
 async fn build_repo_rollup(
-    pool: &PgPool,
+    pool: &DbPool,
     repo: &Repo,
     since: DateTime<Utc>,
 ) -> Result<RepoRollup, anyhow::Error> {
     let created: Vec<(i32, String, i16, String)> = sqlx::query_as(
-        r#"SELECT seq, kind::text, priority, title FROM tasks
+        r#"SELECT seq, kind, priority, title FROM tasks
            WHERE repo_id = $1 AND created_at >= $2
            ORDER BY priority ASC, seq ASC"#,
     )
-    .bind(repo.repo_id)
+    .bind(repo.repo_id.clone())
     .bind(since)
     .fetch_all(pool)
     .await
@@ -99,11 +99,11 @@ async fn build_repo_rollup(
         .collect();
 
     let closed: Vec<(i32, String, i16, String)> = sqlx::query_as(
-        r#"SELECT seq, kind::text, priority, title FROM tasks
+        r#"SELECT seq, kind, priority, title FROM tasks
            WHERE repo_id = $1 AND closed_at >= $2 AND status = 'closed'
            ORDER BY closed_at DESC"#,
     )
-    .bind(repo.repo_id)
+    .bind(repo.repo_id.clone())
     .bind(since)
     .fetch_all(pool)
     .await

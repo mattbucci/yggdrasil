@@ -1,26 +1,27 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, PgPool};
-use uuid::Uuid;
+use sqlx::FromRow;
+
+use crate::db::DbPool;
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct Repo {
-    pub repo_id: Uuid,
+    pub repo_id: String,
     pub canonical_url: Option<String>,
     pub name: String,
     pub task_prefix: String,
-    pub local_paths: Vec<String>,
+    pub local_paths: sqlx::types::Json<Vec<String>>,
     pub metadata: serde_json::Value,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
 pub struct RepoRepo<'a> {
-    pool: &'a PgPool,
+    pool: &'a DbPool,
 }
 
 impl<'a> RepoRepo<'a> {
-    pub fn new(pool: &'a PgPool) -> Self {
+    pub fn new(pool: &'a DbPool) -> Self {
         Self { pool }
     }
 
@@ -35,25 +36,25 @@ impl<'a> RepoRepo<'a> {
         local_path: Option<&str>,
     ) -> Result<Repo, sqlx::Error> {
         // Try to find by URL first
-        if let Some(url) = canonical_url {
-            if let Some(existing) = self.get_by_url(url).await? {
-                if let Some(p) = local_path {
-                    self.append_path(existing.repo_id, p).await?;
-                    return self
-                        .get(existing.repo_id)
-                        .await
-                        .map(|r| r.expect("just updated"));
-                }
-                return Ok(existing);
+        if let Some(url) = canonical_url
+            && let Some(existing) = self.get_by_url(url).await?
+        {
+            if let Some(p) = local_path {
+                self.append_path(&existing.repo_id, p).await?;
+                return self
+                    .get(&existing.repo_id)
+                    .await
+                    .map(|r| r.expect("just updated"));
             }
+            return Ok(existing);
         }
 
         // Else try by prefix (some non-git repos land here)
         if let Some(existing) = self.get_by_prefix(task_prefix).await? {
             if let Some(p) = local_path {
-                self.append_path(existing.repo_id, p).await?;
+                self.append_path(&existing.repo_id, p).await?;
                 return self
-                    .get(existing.repo_id)
+                    .get(&existing.repo_id)
                     .await
                     .map(|r| r.expect("just updated"));
             }
@@ -73,12 +74,12 @@ impl<'a> RepoRepo<'a> {
         .bind(canonical_url)
         .bind(name)
         .bind(task_prefix)
-        .bind(&paths)
+        .bind(sqlx::types::Json(&paths))
         .fetch_one(self.pool)
         .await
     }
 
-    pub async fn get(&self, repo_id: Uuid) -> Result<Option<Repo>, sqlx::Error> {
+    pub async fn get(&self, repo_id: &str) -> Result<Option<Repo>, sqlx::Error> {
         sqlx::query_as::<_, Repo>(
             r#"SELECT repo_id, canonical_url, name, task_prefix, local_paths,
                       metadata, created_at, updated_at
@@ -111,11 +112,13 @@ impl<'a> RepoRepo<'a> {
         .await
     }
 
-    async fn append_path(&self, repo_id: Uuid, path: &str) -> Result<(), sqlx::Error> {
+    async fn append_path(&self, repo_id: &str, path: &str) -> Result<(), sqlx::Error> {
         sqlx::query(
             r#"UPDATE repos
-               SET local_paths = array(SELECT DISTINCT unnest(local_paths || $2::TEXT)),
-                   updated_at = now()
+               SET local_paths = (SELECT json_group_array(value) FROM
+                                  (SELECT value FROM json_each(local_paths)
+                                   UNION SELECT $2)),
+                   updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now')
                WHERE repo_id = $1"#,
         )
         .bind(repo_id)

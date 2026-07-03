@@ -1,10 +1,10 @@
+use crate::db::DbPool;
 use chrono::Timelike;
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::Terminal;
 use ratatui::prelude::*;
-use sqlx::PgPool;
 use std::io;
 use std::time::Duration;
 
@@ -87,16 +87,11 @@ pub struct App {
 /// Which slice of the database the panes filter to. `Repo` is the
 /// current cwd's registered repo (the default — most users care only
 /// about today's work); `All` widens every cwd-scoped query to global.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Scope {
+    #[default]
     Repo,
     All,
-}
-
-impl Default for Scope {
-    fn default() -> Self {
-        Self::Repo
-    }
 }
 
 impl Scope {
@@ -411,9 +406,9 @@ impl App {
     }
 
     /// Pull the 3 most-recent events for the global bottom strip.
-    pub async fn refresh_status_tail(&mut self, pool: &PgPool) {
+    pub async fn refresh_status_tail(&mut self, pool: &DbPool) {
         let rows: Vec<(chrono::DateTime<chrono::Utc>, String, serde_json::Value)> = sqlx::query_as(
-            "SELECT created_at, event_kind::text, payload
+            "SELECT created_at, event_kind, payload
                  FROM events ORDER BY created_at DESC LIMIT 3",
         )
         .fetch_all(pool)
@@ -461,11 +456,11 @@ impl App {
               (SELECT COUNT(*) FROM agents
                 WHERE archived_at IS NULL
                   AND current_state <> 'idle'
-                  AND updated_at >= now() - interval '10 minutes'),
+                  AND updated_at >= strftime('%Y-%m-%dT%H:%M:%f+00:00','now','-10 minutes')),
               (SELECT COUNT(*) FROM agents
                 WHERE archived_at IS NULL
                   AND current_state IN ('executing','waiting_tool','planning','context_flush')
-                  AND updated_at <  now() - interval '10 minutes'),
+                  AND updated_at <  strftime('%Y-%m-%dT%H:%M:%f+00:00','now','-10 minutes')),
               (SELECT COUNT(*) FROM tasks WHERE status = 'in_progress'),
               (SELECT COUNT(*) FROM sessions WHERE ended_at IS NULL)
             "#,
@@ -506,7 +501,7 @@ impl App {
         self.ops_stats.pool_used = pool.size().saturating_sub(pool.num_idle() as u32);
         self.ops_stats.pool_max = pool.options().get_max_connections();
         if let Ok(count) = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*)::bigint FROM events WHERE created_at > now() - interval '1 minute'",
+            "SELECT COUNT(*) FROM events WHERE created_at > strftime('%Y-%m-%dT%H:%M:%f+00:00','now','-1 minute')",
         )
         .fetch_one(pool)
         .await
@@ -521,15 +516,15 @@ impl App {
             let burn: Option<(i64, f64, i64)> = sqlx::query_as(
                 r#"
                 SELECT
-                  COALESCE((SELECT SUM(input_tokens + output_tokens)::bigint
+                  COALESCE((SELECT CAST(SUM(input_tokens + output_tokens) AS INTEGER)
                             FROM agent_stats
-                            WHERE period = date_trunc('hour', now())), 0),
-                  COALESCE((SELECT SUM(estimated_cost)::float8
+                            WHERE period = strftime('%Y-%m-%dT%H:00:00+00:00','now')), 0),
+                  COALESCE((SELECT CAST(SUM(estimated_cost) AS REAL)
                             FROM agent_stats
-                            WHERE period >= date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'), 0.0),
-                  COALESCE((SELECT SUM(input_tokens + output_tokens)::bigint
+                            WHERE period >= strftime('%Y-%m-%dT00:00:00+00:00','now')), 0.0),
+                  COALESCE((SELECT CAST(SUM(input_tokens + output_tokens) AS INTEGER)
                             FROM agent_stats
-                            WHERE period >= date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'), 0)
+                            WHERE period >= strftime('%Y-%m-%dT00:00:00+00:00','now')), 0)
                 "#,
             )
             .fetch_optional(pool)
@@ -545,7 +540,7 @@ impl App {
         }
     }
 
-    pub async fn handle_key(&mut self, pool: &PgPool, code: KeyCode, modifiers: KeyModifiers) {
+    pub async fn handle_key(&mut self, pool: &DbPool, code: KeyCode, modifiers: KeyModifiers) {
         // yggdrasil-155: Tasks-pane inline rename — capture all keys for
         // the input buffer. Esc cancels, Enter commits, Backspace pops,
         // ctrl-c quits. Sits ahead of every other handler so the buffer
@@ -713,7 +708,7 @@ impl App {
                 if matches!(code, KeyCode::Char(c) if c == 'y' || c == 'Y') {
                     if let Some(id) = self.dag.take_pending_delete() {
                         let label = id.to_string()[..8].to_string();
-                        match crate::models::task::TaskRepo::new(pool).delete(id).await {
+                        match crate::models::task::TaskRepo::new(pool).delete(&id).await {
                             Ok(()) => self.dag.flash = format!("deleted {label}"),
                             Err(e) => self.dag.flash = format!("delete failed: {e}"),
                         }
@@ -731,7 +726,7 @@ impl App {
                 if matches!(code, KeyCode::Char(c) if c == 'y' || c == 'Y') {
                     if let Some(id) = self.tasks.take_pending_delete() {
                         let label = id.to_string()[..8].to_string();
-                        match crate::models::task::TaskRepo::new(pool).delete(id).await {
+                        match crate::models::task::TaskRepo::new(pool).delete(&id).await {
                             Ok(()) => self.tasks.set_flash(format!("deleted {label}")),
                             Err(e) => self.tasks.set_flash(format!("delete failed: {e}")),
                         }
@@ -1509,7 +1504,7 @@ fn event_glyph(kind: &str) -> (&'static str, Color) {
 /// Boot reconciliation. Cross-check the workers table against live tmux
 /// windows; abandon any row whose window is gone. Called once at TUI
 /// startup and also cheap to call from anywhere else (idempotent).
-pub async fn reconcile_workers(pool: &PgPool) -> Result<(), anyhow::Error> {
+pub async fn reconcile_workers(pool: &DbPool) -> Result<(), anyhow::Error> {
     use crate::models::worker::{WorkerRepo, WorkerState};
     use std::collections::{HashMap, HashSet};
     let workers = WorkerRepo::new(pool).list_live().await.unwrap_or_default();
@@ -1545,7 +1540,7 @@ pub async fn reconcile_workers(pool: &PgPool) -> Result<(), anyhow::Error> {
         if !live {
             let _ = repo
                 .set_state(
-                    w.worker_id,
+                    &w.worker_id,
                     WorkerState::Abandoned,
                     Some("reconciled at TUI start — window absent"),
                 )
@@ -1610,7 +1605,7 @@ fn short_status_detail(p: &serde_json::Value) -> String {
 }
 
 /// Run the TUI event loop.
-pub async fn run(pool: &PgPool, config: &AppConfig) -> Result<(), anyhow::Error> {
+pub async fn run(pool: &DbPool, config: &AppConfig) -> Result<(), anyhow::Error> {
     terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -1691,10 +1686,10 @@ pub async fn run(pool: &PgPool, config: &AppConfig) -> Result<(), anyhow::Error>
             last_refresh = Some(Instant::now());
         }
 
-        if event::poll(poll_interval)? {
-            if let Event::Key(key) = event::read()? {
-                app.handle_key(pool, key.code, key.modifiers).await;
-            }
+        if event::poll(poll_interval)?
+            && let Event::Key(key) = event::read()?
+        {
+            app.handle_key(pool, key.code, key.modifiers).await;
         }
 
         if app.should_quit {

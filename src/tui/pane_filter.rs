@@ -15,9 +15,10 @@
 
 use tui_input::Input;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FilterMode {
     /// Not filtering — every row passes.
+    #[default]
     Off,
     /// User pressed `/` and is typing; rows already filter live so
     /// they can preview what survives.
@@ -31,12 +32,6 @@ pub enum FilterMode {
 pub struct PaneFilter {
     pub mode: FilterMode,
     pub input: Input,
-}
-
-impl Default for FilterMode {
-    fn default() -> Self {
-        Self::Off
-    }
 }
 
 impl PaneFilter {

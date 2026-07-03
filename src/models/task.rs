@@ -1,7 +1,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, PgPool};
-use uuid::Uuid;
+use sqlx::FromRow;
+
+use crate::db::DbPool;
 
 #[derive(Debug, Clone, PartialEq, sqlx::Type, Serialize, Deserialize)]
 #[sqlx(type_name = "task_status", rename_all = "snake_case")]
@@ -75,8 +76,8 @@ impl std::str::FromStr for TaskKind {
 
 #[derive(Debug, Clone, Serialize, FromRow)]
 pub struct Task {
-    pub task_id: Uuid,
-    pub repo_id: Uuid,
+    pub task_id: String,
+    pub repo_id: String,
     pub seq: i32,
     pub title: String,
     pub description: String,
@@ -86,8 +87,8 @@ pub struct Task {
     pub kind: TaskKind,
     pub status: TaskStatus,
     pub priority: i16,
-    pub created_by: Option<Uuid>,
-    pub assignee: Option<Uuid>,
+    pub created_by: Option<String>,
+    pub assignee: Option<String>,
     pub human_flag: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -112,7 +113,7 @@ pub struct TaskCreate<'a> {
     pub notes: Option<&'a str>,
     pub kind: TaskKind,
     pub priority: i16,
-    pub assignee: Option<Uuid>,
+    pub assignee: Option<String>,
     pub labels: &'a [String],
     pub external_ref: Option<&'a str>,
     pub agent_slug: Option<&'a str>,
@@ -127,25 +128,25 @@ pub struct TaskUpdate<'a> {
     pub notes: Option<&'a str>,
     pub kind: Option<TaskKind>,
     pub priority: Option<i16>,
-    pub assignee: Option<Option<Uuid>>, // Some(Some(id)) sets; Some(None) clears; None leaves alone
+    pub assignee: Option<Option<String>>, // Some(Some(id)) sets; Some(None) clears; None leaves alone
     pub human_flag: Option<bool>,
     pub external_ref: Option<Option<&'a str>>, // Some(Some(s)) sets; Some(None) clears; None leaves alone
 }
 
 pub struct TaskRepo<'a> {
-    pool: &'a PgPool,
+    pool: &'a DbPool,
 }
 
 impl<'a> TaskRepo<'a> {
-    pub fn new(pool: &'a PgPool) -> Self {
+    pub fn new(pool: &'a DbPool) -> Self {
         Self { pool }
     }
 
     /// Atomically allocate the next per-repo sequence number.
     async fn next_seq(
         &self,
-        repo_id: Uuid,
-        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        repo_id: &str,
+        tx: &mut crate::db::DbTx<'_>,
     ) -> Result<i32, sqlx::Error> {
         sqlx::query_scalar::<_, i32>(
             r#"INSERT INTO task_seq (repo_id, next_seq)
@@ -161,8 +162,8 @@ impl<'a> TaskRepo<'a> {
 
     pub async fn create(
         &self,
-        repo_id: Uuid,
-        created_by: Option<Uuid>,
+        repo_id: &str,
+        created_by: Option<String>,
         spec: TaskCreate<'_>,
     ) -> Result<Task, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
@@ -192,7 +193,7 @@ impl<'a> TaskRepo<'a> {
         .bind(spec.notes)
         .bind(&spec.kind)
         .bind(spec.priority)
-        .bind(created_by)
+        .bind(&created_by)
         .bind(spec.assignee)
         .bind(spec.external_ref)
         .bind(runnable_default)
@@ -204,7 +205,7 @@ impl<'a> TaskRepo<'a> {
             sqlx::query(
                 "INSERT INTO task_labels (task_id, label) VALUES ($1, $2) ON CONFLICT DO NOTHING",
             )
-            .bind(task.task_id)
+            .bind(&task.task_id)
             .bind(label)
             .execute(&mut *tx)
             .await?;
@@ -213,17 +214,20 @@ impl<'a> TaskRepo<'a> {
         sqlx::query(
             "INSERT INTO task_events (task_id, agent_id, kind, payload) VALUES ($1, $2, 'created', $3)",
         )
-        .bind(task.task_id)
-        .bind(created_by)
+        .bind(&task.task_id)
+        .bind(&created_by)
         .bind(serde_json::json!({ "title": spec.title }))
         .execute(&mut *tx)
         .await?;
 
         tx.commit().await?;
+        // Wake the scheduler (if one is listening) so runnable tasks dispatch
+        // without waiting out the tick interval. Fire-and-forget.
+        crate::bus::notify("task_created", &task.task_id);
         Ok(task)
     }
 
-    pub async fn get(&self, task_id: Uuid) -> Result<Option<Task>, sqlx::Error> {
+    pub async fn get(&self, task_id: &str) -> Result<Option<Task>, sqlx::Error> {
         sqlx::query_as::<_, Task>(
             r#"SELECT task_id, repo_id, seq, title, description, acceptance, design, notes,
                       kind, status, priority, created_by, assignee, human_flag,
@@ -235,7 +239,7 @@ impl<'a> TaskRepo<'a> {
         .await
     }
 
-    pub async fn get_by_ref(&self, repo_id: Uuid, seq: i32) -> Result<Option<Task>, sqlx::Error> {
+    pub async fn get_by_ref(&self, repo_id: &str, seq: i32) -> Result<Option<Task>, sqlx::Error> {
         sqlx::query_as::<_, Task>(
             r#"SELECT task_id, repo_id, seq, title, description, acceptance, design, notes,
                       kind, status, priority, created_by, assignee, human_flag,
@@ -250,7 +254,7 @@ impl<'a> TaskRepo<'a> {
 
     pub async fn list(
         &self,
-        repo_id: Option<Uuid>,
+        repo_id: Option<String>,
         status: Option<TaskStatus>,
     ) -> Result<Vec<Task>, sqlx::Error> {
         self.list_multi(repo_id, status.map(|s| vec![s]).as_deref())
@@ -261,7 +265,7 @@ impl<'a> TaskRepo<'a> {
     /// None slice means "any status".
     pub async fn list_multi(
         &self,
-        repo_id: Option<Uuid>,
+        repo_id: Option<String>,
         statuses: Option<&[TaskStatus]>,
     ) -> Result<Vec<Task>, sqlx::Error> {
         let status_strs: Vec<String> = statuses
@@ -272,8 +276,8 @@ impl<'a> TaskRepo<'a> {
                       kind, status, priority, created_by, assignee, human_flag,
                       created_at, updated_at, closed_at, close_reason, relevance, external_ref
                FROM tasks
-               WHERE ($1::UUID IS NULL OR repo_id = $1)
-                 AND ($2::text[] IS NULL OR array_length($2, 1) IS NULL OR status::text = ANY($2))
+               WHERE ($1 IS NULL OR repo_id = $1)
+                 AND ($2 IS NULL OR status IN (SELECT value FROM json_each($2)))
                  AND deleted_at IS NULL
                ORDER BY status, priority, seq"#,
         )
@@ -281,7 +285,7 @@ impl<'a> TaskRepo<'a> {
         .bind(if status_strs.is_empty() {
             None
         } else {
-            Some(status_strs)
+            Some(serde_json::to_string(&status_strs).unwrap_or_default())
         })
         .fetch_all(self.pool)
         .await
@@ -289,7 +293,7 @@ impl<'a> TaskRepo<'a> {
 
     /// Return all open/in-progress tasks in the given repo that have no
     /// unsatisfied blockers. Ordered by priority, then seq.
-    pub async fn ready(&self, repo_id: Uuid) -> Result<Vec<Task>, sqlx::Error> {
+    pub async fn ready(&self, repo_id: &str) -> Result<Vec<Task>, sqlx::Error> {
         sqlx::query_as::<_, Task>(
             r#"
             SELECT t.task_id, t.repo_id, t.seq, t.title, t.description, t.acceptance, t.design, t.notes,
@@ -318,17 +322,21 @@ impl<'a> TaskRepo<'a> {
     /// Pass `repo_id = None` to scan every repo. Useful for triage of abandoned
     /// claims — particularly `status = 'in_progress'` rows whose updated_at
     /// has gone quiet.
-    pub async fn stale(&self, repo_id: Option<Uuid>, days: i32) -> Result<Vec<Task>, sqlx::Error> {
+    pub async fn stale(
+        &self,
+        repo_id: Option<String>,
+        days: i32,
+    ) -> Result<Vec<Task>, sqlx::Error> {
         sqlx::query_as::<_, Task>(
             r#"
             SELECT task_id, repo_id, seq, title, description, acceptance, design, notes,
                    kind, status, priority, created_by, assignee, human_flag,
                    created_at, updated_at, closed_at, close_reason, relevance, external_ref
             FROM tasks
-            WHERE ($1::UUID IS NULL OR repo_id = $1)
+            WHERE ($1 IS NULL OR repo_id = $1)
               AND status <> 'closed'
               AND deleted_at IS NULL
-              AND updated_at < now() - make_interval(days => $2)
+              AND updated_at < strftime('%Y-%m-%dT%H:%M:%f+00:00','now','-' || $2 || ' days')
             ORDER BY updated_at ASC, priority, seq
             "#,
         )
@@ -338,7 +346,7 @@ impl<'a> TaskRepo<'a> {
         .await
     }
 
-    pub async fn blocked(&self, repo_id: Uuid) -> Result<Vec<Task>, sqlx::Error> {
+    pub async fn blocked(&self, repo_id: &str) -> Result<Vec<Task>, sqlx::Error> {
         sqlx::query_as::<_, Task>(
             r#"
             SELECT DISTINCT t.task_id, t.repo_id, t.seq, t.title, t.description, t.acceptance, t.design, t.notes,
@@ -362,9 +370,9 @@ impl<'a> TaskRepo<'a> {
 
     pub async fn set_status(
         &self,
-        task_id: Uuid,
+        task_id: &str,
         status: TaskStatus,
-        agent_id: Option<Uuid>,
+        agent_id: Option<String>,
         close_reason: Option<&str>,
     ) -> Result<(), sqlx::Error> {
         let mut tx = self.pool.begin().await?;
@@ -373,9 +381,9 @@ impl<'a> TaskRepo<'a> {
         sqlx::query(
             r#"UPDATE tasks
                SET status = $2,
-                   closed_at = CASE WHEN $2 = 'closed' THEN COALESCE(closed_at, now()) ELSE NULL END,
+                   closed_at = CASE WHEN $2 = 'closed' THEN COALESCE(closed_at, strftime('%Y-%m-%dT%H:%M:%f+00:00','now')) ELSE NULL END,
                    close_reason = CASE WHEN $2 = 'closed' THEN $3 ELSE NULL END,
-                   updated_at = now()
+                   updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now')
                WHERE task_id = $1"#,
         )
         .bind(task_id)
@@ -388,7 +396,7 @@ impl<'a> TaskRepo<'a> {
             "INSERT INTO task_events (task_id, agent_id, kind, payload) VALUES ($1, $2, 'status_change', $3)",
         )
         .bind(task_id)
-        .bind(agent_id)
+        .bind(&agent_id)
         .bind(serde_json::json!({
             "to": status.to_string(),
             "closed_at": closed_at,
@@ -402,70 +410,70 @@ impl<'a> TaskRepo<'a> {
 
     pub async fn update(
         &self,
-        task_id: Uuid,
-        agent_id: Option<Uuid>,
+        task_id: &str,
+        agent_id: Option<String>,
         u: TaskUpdate<'_>,
     ) -> Result<(), sqlx::Error> {
         let mut tx = self.pool.begin().await?;
 
         if let Some(v) = u.title {
-            sqlx::query("UPDATE tasks SET title = $2, updated_at = now() WHERE task_id = $1")
+            sqlx::query("UPDATE tasks SET title = $2, updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now') WHERE task_id = $1")
                 .bind(task_id)
                 .bind(v)
                 .execute(&mut *tx)
                 .await?;
         }
         if let Some(v) = u.description {
-            sqlx::query("UPDATE tasks SET description = $2, updated_at = now() WHERE task_id = $1")
+            sqlx::query("UPDATE tasks SET description = $2, updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now') WHERE task_id = $1")
                 .bind(task_id)
                 .bind(v)
                 .execute(&mut *tx)
                 .await?;
         }
         if let Some(v) = u.acceptance {
-            sqlx::query("UPDATE tasks SET acceptance = $2, updated_at = now() WHERE task_id = $1")
+            sqlx::query("UPDATE tasks SET acceptance = $2, updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now') WHERE task_id = $1")
                 .bind(task_id)
                 .bind(v)
                 .execute(&mut *tx)
                 .await?;
         }
         if let Some(v) = u.design {
-            sqlx::query("UPDATE tasks SET design = $2, updated_at = now() WHERE task_id = $1")
+            sqlx::query("UPDATE tasks SET design = $2, updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now') WHERE task_id = $1")
                 .bind(task_id)
                 .bind(v)
                 .execute(&mut *tx)
                 .await?;
         }
         if let Some(v) = u.notes {
-            sqlx::query("UPDATE tasks SET notes = $2, updated_at = now() WHERE task_id = $1")
+            sqlx::query("UPDATE tasks SET notes = $2, updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now') WHERE task_id = $1")
                 .bind(task_id)
                 .bind(v)
                 .execute(&mut *tx)
                 .await?;
         }
         if let Some(v) = u.kind {
-            sqlx::query("UPDATE tasks SET kind = $2, updated_at = now() WHERE task_id = $1")
+            sqlx::query("UPDATE tasks SET kind = $2, updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now') WHERE task_id = $1")
                 .bind(task_id)
                 .bind(&v)
                 .execute(&mut *tx)
                 .await?;
         }
         if let Some(v) = u.priority {
-            sqlx::query("UPDATE tasks SET priority = $2, updated_at = now() WHERE task_id = $1")
+            sqlx::query("UPDATE tasks SET priority = $2, updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now') WHERE task_id = $1")
                 .bind(task_id)
                 .bind(v)
                 .execute(&mut *tx)
                 .await?;
         }
         if let Some(v) = u.assignee {
-            sqlx::query("UPDATE tasks SET assignee = $2, updated_at = now() WHERE task_id = $1")
+            sqlx::query("UPDATE tasks SET assignee = $2, updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now') WHERE task_id = $1")
                 .bind(task_id)
                 .bind(v)
                 .execute(&mut *tx)
                 .await?;
         }
         if let Some(v) = u.human_flag {
-            sqlx::query("UPDATE tasks SET human_flag = $2, updated_at = now() WHERE task_id = $1")
+            sqlx::query("UPDATE tasks SET human_flag = $2, updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now') WHERE task_id = $1")
                 .bind(task_id)
                 .bind(v)
                 .execute(&mut *tx)
@@ -474,7 +482,7 @@ impl<'a> TaskRepo<'a> {
         if let Some(v) = u.external_ref {
             // Some(Some(s)) sets; Some(None) clears; None leaves alone.
             sqlx::query(
-                "UPDATE tasks SET external_ref = $2, updated_at = now() WHERE task_id = $1",
+                "UPDATE tasks SET external_ref = $2, updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now') WHERE task_id = $1",
             )
             .bind(task_id)
             .bind(v)
@@ -483,7 +491,7 @@ impl<'a> TaskRepo<'a> {
         }
 
         sqlx::query(
-            "INSERT INTO task_events (task_id, agent_id, kind, payload) VALUES ($1, $2, 'updated', '{}'::jsonb)",
+            "INSERT INTO task_events (task_id, agent_id, kind, payload) VALUES ($1, $2, 'updated', '{}')",
         )
         .bind(task_id).bind(agent_id).execute(&mut *tx).await?;
 
@@ -497,15 +505,15 @@ impl<'a> TaskRepo<'a> {
     /// new seq. No-op guard against moving into the same repo lives in the CLI.
     pub async fn move_to_repo(
         &self,
-        task_id: Uuid,
-        target_repo_id: Uuid,
-        agent_id: Option<Uuid>,
+        task_id: &str,
+        target_repo_id: &str,
+        agent_id: Option<String>,
     ) -> Result<i32, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
         let new_seq = self.next_seq(target_repo_id, &mut tx).await?;
 
         sqlx::query(
-            "UPDATE tasks SET repo_id = $2, seq = $3, updated_at = now() WHERE task_id = $1",
+            "UPDATE tasks SET repo_id = $2, seq = $3, updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now') WHERE task_id = $1",
         )
         .bind(task_id)
         .bind(target_repo_id)
@@ -526,7 +534,7 @@ impl<'a> TaskRepo<'a> {
         Ok(new_seq)
     }
 
-    pub async fn add_dep(&self, task_id: Uuid, blocker_id: Uuid) -> Result<(), sqlx::Error> {
+    pub async fn add_dep(&self, task_id: &str, blocker_id: &str) -> Result<(), sqlx::Error> {
         if task_id == blocker_id {
             return Err(sqlx::Error::Protocol("task cannot depend on itself".into()));
         }
@@ -534,7 +542,7 @@ impl<'a> TaskRepo<'a> {
         let cycle = sqlx::query_scalar::<_, bool>(
             r#"
             WITH RECURSIVE reachable(tid) AS (
-                SELECT $1::UUID
+                SELECT $1
                 UNION
                 SELECT d.blocker_id FROM task_deps d JOIN reachable r ON r.tid = d.task_id
             )
@@ -564,22 +572,29 @@ impl<'a> TaskRepo<'a> {
     /// graph already contains. Each returned vec is one cycle in order
     /// (without the duplicate closing vertex), canonicalized so its smallest
     /// UUID appears first; identical rotations of the same cycle dedupe.
-    pub async fn find_cycles(&self, repo_id: Option<Uuid>) -> Result<Vec<Vec<Uuid>>, sqlx::Error> {
-        let rows: Vec<(Vec<Uuid>,)> = sqlx::query_as(
+    pub async fn find_cycles(
+        &self,
+        repo_id: Option<String>,
+    ) -> Result<Vec<Vec<String>>, sqlx::Error> {
+        // Path is a comma-delimited id list (",a,b,c,") — SQLite has no
+        // array type; instr() on the delimited form is the canonical cycle
+        // probe from the SQLite recursive-CTE docs.
+        let rows: Vec<(String,)> = sqlx::query_as(
             r#"
-            WITH RECURSIVE walk(start_tid, tid, path, has_cycle) AS (
+            WITH RECURSIVE walk(start_tid, tid, path, depth, has_cycle) AS (
                 SELECT d.task_id, d.blocker_id,
-                       ARRAY[d.task_id, d.blocker_id], FALSE
+                       ',' || d.task_id || ',' || d.blocker_id || ',', 2, 0
                 FROM task_deps d
                 JOIN tasks t ON t.task_id = d.task_id
-                WHERE $1::UUID IS NULL OR t.repo_id = $1
+                WHERE $1 IS NULL OR t.repo_id = $1
                 UNION ALL
                 SELECT w.start_tid, d.blocker_id,
-                       w.path || d.blocker_id,
-                       d.blocker_id = ANY(w.path)
+                       w.path || d.blocker_id || ',',
+                       w.depth + 1,
+                       instr(w.path, ',' || d.blocker_id || ',') > 0
                 FROM walk w
                 JOIN task_deps d ON d.task_id = w.tid
-                WHERE NOT w.has_cycle AND array_length(w.path, 1) < 100
+                WHERE NOT w.has_cycle AND w.depth < 100
             )
             SELECT path FROM walk WHERE has_cycle
             "#,
@@ -587,14 +602,24 @@ impl<'a> TaskRepo<'a> {
         .bind(repo_id)
         .fetch_all(self.pool)
         .await?;
+        let rows: Vec<(Vec<String>,)> = rows
+            .into_iter()
+            .map(|(path,)| {
+                (path
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect(),)
+            })
+            .collect();
 
-        let mut seen: std::collections::HashSet<Vec<Uuid>> = Default::default();
-        let mut cycles: Vec<Vec<Uuid>> = Vec::new();
+        let mut seen: std::collections::HashSet<Vec<String>> = Default::default();
+        let mut cycles: Vec<Vec<String>> = Vec::new();
         for (path,) in rows {
             // Path comes back as [v0, v1, ..., vk] where vk == some earlier vi.
             // Slice to the cycle proper: [vi, v_{i+1}, ..., v_{k-1}].
             let last = match path.last() {
-                Some(u) => *u,
+                Some(u) => u.clone(),
                 None => continue,
             };
             let start_idx = match path.iter().position(|u| *u == last) {
@@ -625,7 +650,7 @@ impl<'a> TaskRepo<'a> {
         Ok(cycles)
     }
 
-    pub async fn remove_dep(&self, task_id: Uuid, blocker_id: Uuid) -> Result<(), sqlx::Error> {
+    pub async fn remove_dep(&self, task_id: &str, blocker_id: &str) -> Result<(), sqlx::Error> {
         sqlx::query("DELETE FROM task_deps WHERE task_id = $1 AND blocker_id = $2")
             .bind(task_id)
             .bind(blocker_id)
@@ -641,7 +666,7 @@ impl<'a> TaskRepo<'a> {
     /// or global when None. Open, non-deleted tasks only.
     pub async fn find_dupes(
         &self,
-        repo_id: Option<Uuid>,
+        repo_id: Option<String>,
         min_similarity: f64,
         limit: i64,
     ) -> Result<Vec<(Task, Task, f64)>, sqlx::Error> {
@@ -650,7 +675,7 @@ impl<'a> TaskRepo<'a> {
                       kind, status, priority, created_by, assignee, human_flag,
                       created_at, updated_at, closed_at, close_reason, relevance, external_ref
                FROM tasks
-               WHERE ($1::UUID IS NULL OR repo_id = $1)
+               WHERE ($1 IS NULL OR repo_id = $1)
                  AND status <> 'closed'
                  AND deleted_at IS NULL
                ORDER BY created_at"#,
@@ -711,7 +736,7 @@ impl<'a> TaskRepo<'a> {
         Ok(pairs)
     }
 
-    pub async fn add_label(&self, task_id: Uuid, label: &str) -> Result<(), sqlx::Error> {
+    pub async fn add_label(&self, task_id: &str, label: &str) -> Result<(), sqlx::Error> {
         sqlx::query(
             "INSERT INTO task_labels (task_id, label) VALUES ($1, $2) ON CONFLICT DO NOTHING",
         )
@@ -722,7 +747,7 @@ impl<'a> TaskRepo<'a> {
         Ok(())
     }
 
-    pub async fn remove_label(&self, task_id: Uuid, label: &str) -> Result<u64, sqlx::Error> {
+    pub async fn remove_label(&self, task_id: &str, label: &str) -> Result<u64, sqlx::Error> {
         let res = sqlx::query("DELETE FROM task_labels WHERE task_id = $1 AND label = $2")
             .bind(task_id)
             .bind(label)
@@ -735,13 +760,13 @@ impl<'a> TaskRepo<'a> {
     /// with usage count. Backs `ygg task label list-all` and label-picker UIs.
     pub async fn all_labels(
         &self,
-        repo_id: Option<Uuid>,
+        repo_id: Option<String>,
     ) -> Result<Vec<(String, i64)>, sqlx::Error> {
         sqlx::query_as::<_, (String, i64)>(
-            r#"SELECT tl.label, COUNT(*)::bigint
+            r#"SELECT tl.label, COUNT(*)
                FROM task_labels tl
                JOIN tasks t USING (task_id)
-               WHERE $1::UUID IS NULL OR t.repo_id = $1
+               WHERE $1 IS NULL OR t.repo_id = $1
                GROUP BY tl.label
                ORDER BY COUNT(*) DESC, tl.label"#,
         )
@@ -751,11 +776,11 @@ impl<'a> TaskRepo<'a> {
     }
 
     /// Adjust relevance by a delta; clamped to 0..100.
-    pub async fn bump_relevance(&self, task_id: Uuid, delta: i32) -> Result<i32, sqlx::Error> {
+    pub async fn bump_relevance(&self, task_id: &str, delta: i32) -> Result<i32, sqlx::Error> {
         let new_val: i32 = sqlx::query_scalar(
             r#"UPDATE tasks
-                  SET relevance = GREATEST(0, LEAST(100, relevance + $2)),
-                      updated_at = now()
+                  SET relevance = MAX(0, MIN(100, relevance + $2)),
+                      updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now')
                 WHERE task_id = $1
                 RETURNING relevance"#,
         )
@@ -768,13 +793,13 @@ impl<'a> TaskRepo<'a> {
 
     pub async fn add_link(
         &self,
-        task_id: Uuid,
-        target_id: Uuid,
+        task_id: &str,
+        target_id: &str,
         kind: &str,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
             "INSERT INTO task_links (task_id, target_id, kind)
-             VALUES ($1, $2, $3::task_link_kind)
+             VALUES ($1, $2, $3)
              ON CONFLICT DO NOTHING",
         )
         .bind(task_id)
@@ -785,16 +810,16 @@ impl<'a> TaskRepo<'a> {
         Ok(())
     }
 
-    pub async fn links(&self, task_id: Uuid) -> Result<Vec<(String, Uuid)>, sqlx::Error> {
-        sqlx::query_as::<_, (String, Uuid)>(
-            "SELECT kind::text, target_id FROM task_links WHERE task_id = $1 ORDER BY created_at",
+    pub async fn links(&self, task_id: &str) -> Result<Vec<(String, String)>, sqlx::Error> {
+        sqlx::query_as::<_, (String, String)>(
+            "SELECT kind, target_id FROM task_links WHERE task_id = $1 ORDER BY created_at",
         )
         .bind(task_id)
         .fetch_all(self.pool)
         .await
     }
 
-    pub async fn labels(&self, task_id: Uuid) -> Result<Vec<String>, sqlx::Error> {
+    pub async fn labels(&self, task_id: &str) -> Result<Vec<String>, sqlx::Error> {
         sqlx::query_scalar::<_, String>(
             "SELECT label FROM task_labels WHERE task_id = $1 ORDER BY label",
         )
@@ -803,7 +828,7 @@ impl<'a> TaskRepo<'a> {
         .await
     }
 
-    pub async fn deps(&self, task_id: Uuid) -> Result<Vec<Task>, sqlx::Error> {
+    pub async fn deps(&self, task_id: &str) -> Result<Vec<Task>, sqlx::Error> {
         sqlx::query_as::<_, Task>(
             r#"SELECT t.task_id, t.repo_id, t.seq, t.title, t.description, t.acceptance, t.design, t.notes,
                       t.kind, t.status, t.priority, t.created_by, t.assignee, t.human_flag,
@@ -817,7 +842,7 @@ impl<'a> TaskRepo<'a> {
 
     /// Hard-delete a task. FK cascades handle task_deps, task_events,
     /// task_relevance, and worker rows — no manual cleanup needed.
-    pub async fn delete(&self, task_id: Uuid) -> Result<(), sqlx::Error> {
+    pub async fn delete(&self, task_id: &str) -> Result<(), sqlx::Error> {
         sqlx::query("DELETE FROM tasks WHERE task_id = $1")
             .bind(task_id)
             .execute(self.pool)
@@ -829,9 +854,9 @@ impl<'a> TaskRepo<'a> {
     /// stop returning it. Already-deleted rows are touched again so the
     /// 30-day purge clock resets — useful when a user restores then
     /// re-deletes. Returns whether the row exists.
-    pub async fn soft_delete(&self, task_id: Uuid) -> Result<bool, sqlx::Error> {
+    pub async fn soft_delete(&self, task_id: &str) -> Result<bool, sqlx::Error> {
         let n = sqlx::query(
-            "UPDATE tasks SET deleted_at = now(), updated_at = now() WHERE task_id = $1",
+            "UPDATE tasks SET deleted_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now'), updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now') WHERE task_id = $1",
         )
         .bind(task_id)
         .execute(self.pool)
@@ -842,11 +867,11 @@ impl<'a> TaskRepo<'a> {
 
     /// Pull a task back from the trash. Returns whether anything changed —
     /// `false` for a missing row or a row that was never deleted.
-    pub async fn restore(&self, task_id: Uuid) -> Result<bool, sqlx::Error> {
+    pub async fn restore(&self, task_id: &str) -> Result<bool, sqlx::Error> {
         let n = sqlx::query(
             r#"UPDATE tasks
                SET deleted_at = NULL,
-                   updated_at = now()
+                   updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now')
                WHERE task_id = $1 AND deleted_at IS NOT NULL"#,
         )
         .bind(task_id)
@@ -859,14 +884,14 @@ impl<'a> TaskRepo<'a> {
     /// List tasks that are in the trash. Scoped to `repo_id`, or global
     /// when None. Newest-trashed first so a human reviewing what to restore
     /// or purge sees recent moves at the top.
-    pub async fn list_trashed(&self, repo_id: Option<Uuid>) -> Result<Vec<Task>, sqlx::Error> {
+    pub async fn list_trashed(&self, repo_id: Option<String>) -> Result<Vec<Task>, sqlx::Error> {
         sqlx::query_as::<_, Task>(
             r#"SELECT task_id, repo_id, seq, title, description, acceptance, design, notes,
                       kind, status, priority, created_by, assignee, human_flag,
                       created_at, updated_at, closed_at, close_reason, relevance, external_ref
                FROM tasks
                WHERE deleted_at IS NOT NULL
-                 AND ($1::UUID IS NULL OR repo_id = $1)
+                 AND ($1 IS NULL OR repo_id = $1)
                ORDER BY deleted_at DESC, seq"#,
         )
         .bind(repo_id)
@@ -880,13 +905,13 @@ impl<'a> TaskRepo<'a> {
     pub async fn purge_older_than(
         &self,
         older_than_days: i32,
-        repo_id: Option<Uuid>,
+        repo_id: Option<String>,
     ) -> Result<u64, sqlx::Error> {
         let n = sqlx::query(
             r#"DELETE FROM tasks
                WHERE deleted_at IS NOT NULL
-                 AND deleted_at < now() - make_interval(days => $1)
-                 AND ($2::UUID IS NULL OR repo_id = $2)"#,
+                 AND deleted_at < strftime('%Y-%m-%dT%H:%M:%f+00:00','now','-' || $1 || ' days')
+                 AND ($2 IS NULL OR repo_id = $2)"#,
         )
         .bind(older_than_days)
         .bind(repo_id)
@@ -896,7 +921,7 @@ impl<'a> TaskRepo<'a> {
         Ok(n)
     }
 
-    pub async fn stats(&self, repo_id: Option<Uuid>) -> Result<TaskStats, sqlx::Error> {
+    pub async fn stats(&self, repo_id: Option<String>) -> Result<TaskStats, sqlx::Error> {
         let row: (i64, i64, i64, i64) = sqlx::query_as(
             r#"SELECT
                    COUNT(*) FILTER (WHERE status = 'open'),
@@ -904,7 +929,7 @@ impl<'a> TaskRepo<'a> {
                    COUNT(*) FILTER (WHERE status = 'blocked'),
                    COUNT(*) FILTER (WHERE status = 'closed')
                FROM tasks
-               WHERE $1::UUID IS NULL OR repo_id = $1"#,
+               WHERE $1 IS NULL OR repo_id = $1"#,
         )
         .bind(repo_id)
         .fetch_one(self.pool)

@@ -5,8 +5,9 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, PgPool};
-use uuid::Uuid;
+use sqlx::FromRow;
+
+use crate::db::DbPool;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type, Serialize, Deserialize)]
 #[sqlx(type_name = "run_state", rename_all = "snake_case")]
@@ -138,10 +139,10 @@ impl std::str::FromStr for RunReason {
 
 #[derive(Debug, Clone, Serialize, FromRow)]
 pub struct TaskRun {
-    pub run_id: Uuid,
-    pub task_id: Uuid,
+    pub run_id: String,
+    pub task_id: String,
     pub attempt: i32,
-    pub parent_run_id: Option<Uuid>,
+    pub parent_run_id: Option<String>,
     pub idempotency_key: String,
     pub state: RunState,
     pub reason: RunReason,
@@ -151,9 +152,9 @@ pub struct TaskRun {
     pub ended_at: Option<DateTime<Utc>>,
     pub heartbeat_at: Option<DateTime<Utc>>,
     pub heartbeat_ttl_s: i32,
-    pub agent_id: Option<Uuid>,
-    pub worker_id: Option<Uuid>,
-    pub session_id: Option<Uuid>,
+    pub agent_id: Option<String>,
+    pub worker_id: Option<String>,
+    pub session_id: Option<String>,
     pub max_attempts: i32,
     pub retry_strategy: serde_json::Value,
     pub deadline_at: Option<DateTime<Utc>>,
@@ -174,9 +175,9 @@ pub struct TaskRun {
 /// typically populate `task_id`, `attempt`, `idempotency_key`, and `input`.
 #[derive(Debug, Default)]
 pub struct TaskRunCreate {
-    pub task_id: Uuid,
+    pub task_id: String,
     pub attempt: i32,
-    pub parent_run_id: Option<Uuid>,
+    pub parent_run_id: Option<String>,
     pub max_attempts: Option<i32>,
     pub retry_strategy: Option<serde_json::Value>,
     pub deadline_at: Option<DateTime<Utc>>,
@@ -188,7 +189,7 @@ pub struct TaskRunCreate {
 /// through the blob store; see `src/blob.rs`. Aligns with TOAST cliff guidance.
 pub const MAX_INLINE_PAYLOAD_BYTES: usize = 16 * 1024;
 
-pub fn idempotency_key_for(task_id: Uuid, attempt: i32) -> String {
+pub fn idempotency_key_for(task_id: &str, attempt: i32) -> String {
     format!("run:{task_id}:attempt:{attempt}")
 }
 
@@ -244,11 +245,11 @@ pub fn route_payload(
 }
 
 pub struct TaskRunRepo<'a> {
-    pool: &'a PgPool,
+    pool: &'a DbPool,
 }
 
 impl<'a> TaskRunRepo<'a> {
-    pub fn new(pool: &'a PgPool) -> Self {
+    pub fn new(pool: &'a DbPool) -> Self {
         Self { pool }
     }
 
@@ -256,9 +257,9 @@ impl<'a> TaskRunRepo<'a> {
     /// so duplicate inserts collide on the UNIQUE constraint and surface as
     /// errors rather than silent doubles.
     pub async fn create(&self, spec: TaskRunCreate) -> Result<TaskRun, sqlx::Error> {
-        check_inline_size(&spec.input, "input").map_err(|e| sqlx::Error::Protocol(e.into()))?;
+        check_inline_size(&spec.input, "input").map_err(sqlx::Error::Protocol)?;
 
-        let key = idempotency_key_for(spec.task_id, spec.attempt);
+        let key = idempotency_key_for(&spec.task_id, spec.attempt);
         let max_attempts = spec.max_attempts.unwrap_or(3);
         let heartbeat_ttl_s = spec.heartbeat_ttl_s.unwrap_or(300);
 
@@ -267,7 +268,7 @@ impl<'a> TaskRunRepo<'a> {
                (task_id, attempt, parent_run_id, idempotency_key,
                 max_attempts, retry_strategy, deadline_at, heartbeat_ttl_s, input)
                VALUES ($1, $2, $3, $4, $5,
-                       COALESCE($6, '{"kind":"exponential","base_ms":60000,"cap_ms":600000,"jitter":true}'::jsonb),
+                       COALESCE($6, '{"kind":"exponential","base_ms":60000,"cap_ms":600000,"jitter":true}'),
                        $7, $8, $9)
                RETURNING *"#,
         )
@@ -284,7 +285,7 @@ impl<'a> TaskRunRepo<'a> {
         .await
     }
 
-    pub async fn get(&self, run_id: Uuid) -> Result<Option<TaskRun>, sqlx::Error> {
+    pub async fn get(&self, run_id: &str) -> Result<Option<TaskRun>, sqlx::Error> {
         sqlx::query_as::<_, TaskRun>("SELECT * FROM task_runs WHERE run_id = $1")
             .bind(run_id)
             .fetch_optional(self.pool)
@@ -292,7 +293,7 @@ impl<'a> TaskRunRepo<'a> {
     }
 
     /// Most recent attempts first.
-    pub async fn list_by_task(&self, task_id: Uuid) -> Result<Vec<TaskRun>, sqlx::Error> {
+    pub async fn list_by_task(&self, task_id: &str) -> Result<Vec<TaskRun>, sqlx::Error> {
         sqlx::query_as::<_, TaskRun>(
             "SELECT * FROM task_runs WHERE task_id = $1 ORDER BY attempt DESC",
         )
@@ -302,7 +303,7 @@ impl<'a> TaskRunRepo<'a> {
     }
 
     /// Latest attempt for a task, if any.
-    pub async fn latest(&self, task_id: Uuid) -> Result<Option<TaskRun>, sqlx::Error> {
+    pub async fn latest(&self, task_id: &str) -> Result<Option<TaskRun>, sqlx::Error> {
         sqlx::query_as::<_, TaskRun>(
             "SELECT * FROM task_runs WHERE task_id = $1 ORDER BY attempt DESC LIMIT 1",
         )
@@ -313,9 +314,9 @@ impl<'a> TaskRunRepo<'a> {
 
     /// Heartbeat bump — typically called by the PreToolUse hook on every tool
     /// invocation so the scheduler knows the run is alive.
-    pub async fn heartbeat(&self, run_id: Uuid) -> Result<(), sqlx::Error> {
+    pub async fn heartbeat(&self, run_id: &str) -> Result<(), sqlx::Error> {
         sqlx::query(
-            "UPDATE task_runs SET heartbeat_at = now(), updated_at = now() WHERE run_id = $1",
+            "UPDATE task_runs SET heartbeat_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now'), updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now') WHERE run_id = $1",
         )
         .bind(run_id)
         .execute(self.pool)
@@ -330,18 +331,18 @@ impl<'a> TaskRunRepo<'a> {
     /// without ambiguity.
     pub async fn write_output(
         &self,
-        run_id: Uuid,
+        run_id: &str,
         payload: &serde_json::Value,
         store: &crate::blob::BlobStore,
     ) -> Result<PayloadSink, sqlx::Error> {
-        let sink = route_payload(payload, store).map_err(|e| sqlx::Error::Protocol(e.into()))?;
+        let sink = route_payload(payload, store).map_err(sqlx::Error::Protocol)?;
         match &sink {
             PayloadSink::Inline(value) => {
                 sqlx::query(
                     r#"UPDATE task_runs
                        SET output = $2,
                            output_blob_ref = NULL,
-                           updated_at = now()
+                           updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now')
                        WHERE run_id = $1"#,
                 )
                 .bind(run_id)
@@ -354,7 +355,7 @@ impl<'a> TaskRunRepo<'a> {
                     r#"UPDATE task_runs
                        SET output = NULL,
                            output_blob_ref = $2,
-                           updated_at = now()
+                           updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now')
                        WHERE run_id = $1"#,
                 )
                 .bind(run_id)
@@ -371,15 +372,15 @@ impl<'a> TaskRunRepo<'a> {
     /// for debugging can spike, so the same routing applies.
     pub async fn write_error(
         &self,
-        run_id: Uuid,
+        run_id: &str,
         payload: &serde_json::Value,
         store: &crate::blob::BlobStore,
     ) -> Result<PayloadSink, sqlx::Error> {
-        let sink = route_payload(payload, store).map_err(|e| sqlx::Error::Protocol(e.into()))?;
+        let sink = route_payload(payload, store).map_err(sqlx::Error::Protocol)?;
         match &sink {
             PayloadSink::Inline(value) => {
                 sqlx::query(
-                    "UPDATE task_runs SET error = $2, updated_at = now() WHERE run_id = $1",
+                    "UPDATE task_runs SET error = $2, updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now') WHERE run_id = $1",
                 )
                 .bind(run_id)
                 .bind(value)
@@ -398,7 +399,7 @@ impl<'a> TaskRunRepo<'a> {
                     r#"UPDATE task_runs
                        SET error = $2,
                            output_blob_ref = COALESCE(output_blob_ref, $3),
-                           updated_at = now()
+                           updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now')
                        WHERE run_id = $1"#,
                 )
                 .bind(run_id)
@@ -416,7 +417,7 @@ impl<'a> TaskRunRepo<'a> {
     /// to a terminal state.
     pub async fn set_state(
         &self,
-        run_id: Uuid,
+        run_id: &str,
         state: RunState,
         reason: RunReason,
     ) -> Result<(), sqlx::Error> {
@@ -425,8 +426,8 @@ impl<'a> TaskRunRepo<'a> {
             r#"UPDATE task_runs
                SET state = $2,
                    reason = $3,
-                   ended_at = CASE WHEN $4 THEN COALESCE(ended_at, now()) ELSE ended_at END,
-                   updated_at = now()
+                   ended_at = CASE WHEN $4 THEN COALESCE(ended_at, strftime('%Y-%m-%dT%H:%M:%f+00:00','now')) ELSE ended_at END,
+                   updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now')
                WHERE run_id = $1"#,
         )
         .bind(run_id)
@@ -466,9 +467,9 @@ mod tests {
 
     #[test]
     fn idempotency_key_format() {
-        let id: Uuid = "11111111-1111-1111-1111-111111111111".parse().unwrap();
+        let id: String = "11111111-1111-1111-1111-111111111111".parse().unwrap();
         assert_eq!(
-            idempotency_key_for(id, 1),
+            idempotency_key_for(&id, 1),
             "run:11111111-1111-1111-1111-111111111111:attempt:1"
         );
     }

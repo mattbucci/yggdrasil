@@ -10,7 +10,7 @@
 
 use std::time::{Duration, Instant};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct PipState {
     /// `Some(_)` while a hover is being timed; `None` means nothing
     /// is dwelling.
@@ -40,15 +40,6 @@ pub const HOVER_DWELL: Duration = Duration::from_millis(200);
 /// Maximum stdout lines retained per popup. 200 lines × 80 cols
 /// covers a typical Claude turn end-to-end without bloating memory.
 pub const TRANSCRIPT_CAP: usize = 200;
-
-impl Default for PipState {
-    fn default() -> Self {
-        Self {
-            hover: None,
-            open: None,
-        }
-    }
-}
 
 impl PipState {
     /// User cursor moved to a new row. If the same agent was already

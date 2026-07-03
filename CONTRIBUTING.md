@@ -6,7 +6,7 @@ Thanks for your interest. Yggdrasil is in active development; the public API and
 
 1. **Branch from `main`.** Use a short, descriptive name (`scheduler-fanout`, `bench-scenario-3`, `fix-lock-race`).
 2. **Work in small, focused commits.** Match the style of recent log: imperative, lowercase, area-prefixed (`scheduler:`, `bench:`, `tui:`, `docs:`). One commit can span multiple files; bundling related work is fine.
-3. **Open a PR into `main`.** CI runs `cargo fmt --check`, `cargo check --all-targets`, `cargo test --lib`, and `cargo test --test integration` against a Postgres + pgvector service container. Clippy runs advisory while we burn down existing warnings.
+3. **Open a PR into `main`.** CI runs `cargo fmt --check`, `cargo check --all-targets`, and `cargo test` (embedded SQLite — every test provisions its own migrated temp database, no service containers). Clippy runs advisory while we burn down existing warnings.
 4. **Reference any related tasks** (`yggdrasil-NNN`) in the PR description so the rollup updates.
 5. **Squash or rebase merges** are both fine; no merge commits into `main` please.
 
@@ -15,16 +15,15 @@ Direct pushes to `main` are reserved for trivial fixes (typos, generated artifac
 ## Setting up
 
 ```bash
-docker-compose up -d              # Postgres 16 + pgvector
 make install                      # cargo build --release && copy to ~/.local/bin
-ygg init                          # install hooks, run migrations
+ygg init                          # install hooks, create the SQLite DB, run migrations
 ygg up                            # tmux dashboard
 ```
 
 ## Tests
 
-- **Library tests** are fast and don't need Postgres: `cargo test --lib`.
-- **Integration tests** require a running Postgres at `DATABASE_URL`. CI uses `postgres://postgres:postgres@localhost:5432/ygg` (the pgvector service container's defaults). Locally the docker-compose default `postgres://localhost:5432/ygg` works too. Run: `DATABASE_URL=postgres://postgres:postgres@localhost:5432/ygg cargo test --test integration -- --test-threads=1`.
+- **Library tests** are fast and pure-Rust: `cargo test --lib`.
+- **Integration tests** run against an embedded SQLite database — each test creates its own migrated temp DB, so `cargo test` needs no services and runs fully parallel. Set `DATABASE_URL` (a `sqlite://` URL) to point them at a persistent database instead.
 - **Bench tests** use a fake `claude` binary at `benches/fixtures/fake-claude.sh` so they run in CI without API tokens. Real `ygg bench` runs invoke the real `claude` CLI; set `YGG_BENCH_CLAUDE_BIN` to override.
 
 ## ADRs

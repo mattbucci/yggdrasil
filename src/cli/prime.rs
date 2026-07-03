@@ -11,7 +11,6 @@ use crate::{
     },
 };
 use chrono::{DateTime, Utc};
-use uuid::Uuid;
 
 /// Output agent context as markdown — injected by SessionStart and PreCompact hooks.
 /// Accepts an optional transcript path to estimate context pressure from file size.
@@ -63,7 +62,7 @@ async fn try_with_db(
 
     let lock_mgr = LockManager::new(&pool, config.lock_ttl_secs, crate::db::user_id());
     let locks = lock_mgr
-        .list_agent_locks(agent.agent_id)
+        .list_agent_locks(&agent.agent_id)
         .await
         .unwrap_or_default()
         .into_iter()
@@ -114,8 +113,8 @@ async fn try_with_db(
 }
 
 async fn resolve_repo_context(
-    pool: &sqlx::PgPool,
-) -> (Option<String>, Option<Uuid>, Vec<Task>, i64, Vec<Memory>) {
+    pool: &crate::db::DbPool,
+) -> (Option<String>, Option<String>, Vec<Task>, i64, Vec<Memory>) {
     // Recent global notes show even outside a known repo.
     let global_notes = || async {
         MemoryRepo::new(pool)
@@ -148,11 +147,11 @@ async fn resolve_repo_context(
         return (None, None, vec![], 0, global_notes().await);
     };
     let task_repo = TaskRepo::new(pool);
-    let ready = task_repo.ready(repo.repo_id).await.unwrap_or_default();
-    let stats = task_repo.stats(Some(repo.repo_id)).await.ok();
+    let ready = task_repo.ready(&repo.repo_id).await.unwrap_or_default();
+    let stats = task_repo.stats(Some(repo.repo_id.clone())).await.ok();
     let open_count = stats.map(|s| s.open + s.in_progress).unwrap_or(0);
     let notes = MemoryRepo::new(pool)
-        .list(Some(repo.repo_id), false, 5)
+        .list(Some(repo.repo_id.clone()), false, 5)
         .await
         .unwrap_or_default();
     (

@@ -13,7 +13,6 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use uuid::Uuid;
 
 use crate::models::repo::{Repo, RepoRepo};
 use crate::models::task::{Task, TaskRepo};
@@ -38,7 +37,7 @@ pub struct Worktree {
 
 /// Create (or return existing) worktree for the given task. The caller is
 /// responsible for having at least one local_path recorded on the repo.
-pub async fn ensure(pool: &sqlx::PgPool, task_id: Uuid) -> Result<Worktree, anyhow::Error> {
+pub async fn ensure(pool: &crate::db::DbPool, task_id: String) -> Result<Worktree, anyhow::Error> {
     let (task, repo) = resolve(pool, task_id).await?;
     let task_ref = format!("{}-{}", repo.task_prefix, task.seq);
     let branch = format!("ygg/{task_ref}");
@@ -114,8 +113,8 @@ pub async fn ensure(pool: &sqlx::PgPool, task_id: Uuid) -> Result<Worktree, anyh
 /// the local branch; `Archive` leaves the branch. Never force-removes if
 /// the worktree has uncommitted changes unless `force = true`.
 pub async fn teardown(
-    pool: &sqlx::PgPool,
-    task_id: Uuid,
+    pool: &crate::db::DbPool,
+    task_id: String,
     policy: TeardownPolicy,
     force: bool,
 ) -> Result<(), anyhow::Error> {
@@ -155,10 +154,10 @@ pub async fn teardown(
 }
 
 pub fn worktree_root() -> Result<PathBuf, anyhow::Error> {
-    if let Ok(x) = std::env::var("XDG_STATE_HOME") {
-        if !x.is_empty() {
-            return Ok(PathBuf::from(x).join("ygg/worktrees"));
-        }
+    if let Ok(x) = std::env::var("XDG_STATE_HOME")
+        && !x.is_empty()
+    {
+        return Ok(PathBuf::from(x).join("ygg/worktrees"));
     }
     let home = std::env::var("HOME")
         .map_err(|_| anyhow::anyhow!("HOME not set — cannot locate worktree root"))?;
@@ -166,13 +165,13 @@ pub fn worktree_root() -> Result<PathBuf, anyhow::Error> {
 }
 
 /// Lookup the task + its repo in one shot.
-async fn resolve(pool: &sqlx::PgPool, task_id: Uuid) -> Result<(Task, Repo), anyhow::Error> {
+async fn resolve(pool: &crate::db::DbPool, task_id: String) -> Result<(Task, Repo), anyhow::Error> {
     let task = TaskRepo::new(pool)
-        .get(task_id)
+        .get(&task_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("task {task_id} not found"))?;
     let repo = RepoRepo::new(pool)
-        .get(task.repo_id)
+        .get(&task.repo_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("repo {} not found", task.repo_id))?;
     Ok((task, repo))
@@ -181,7 +180,7 @@ async fn resolve(pool: &sqlx::PgPool, task_id: Uuid) -> Result<(Task, Repo), any
 /// Pick the first local_path that's an actual git working tree. Repos
 /// register multiple candidate paths over time; some may be stale.
 fn primary_local_path(repo: &Repo) -> Option<PathBuf> {
-    for p in &repo.local_paths {
+    for p in repo.local_paths.iter() {
         let path = PathBuf::from(p);
         if path.join(".git").exists() || is_git_dir(&path) {
             return Some(path);
@@ -245,7 +244,7 @@ fn git_stdout(cwd: &Path, args: &[&str]) -> Result<String, anyhow::Error> {
 /// tree without disturbing the agent's staged state; `commit-tree -p HEAD`
 /// parents it on the current commit and `update-ref` parks it on the recovery
 /// ref, which lives in the shared git dir and survives `git worktree remove`.
-pub fn checkpoint(worktree: &Path, run_id: Uuid) -> Option<String> {
+pub fn checkpoint(worktree: &Path, run_id: String) -> Option<String> {
     let index = std::env::temp_dir().join(format!("ygg-recovery-{run_id}.index"));
     let _ = std::fs::remove_file(&index);
     let run = |args: &[&str]| -> Option<String> {
@@ -293,6 +292,7 @@ pub fn parse_policy(s: &str) -> Result<TeardownPolicy, anyhow::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uuid::Uuid;
 
     #[test]
     fn policy_parse() {
@@ -351,8 +351,8 @@ mod tests {
         std::fs::write(dir.join("a.txt"), "v2\n").unwrap();
         std::fs::write(dir.join("b.txt"), "new\n").unwrap();
 
-        let run_id = Uuid::new_v4();
-        let sha = checkpoint(&dir, run_id).expect("checkpoint sha");
+        let run_id = Uuid::new_v4().to_string();
+        let sha = checkpoint(&dir, run_id.clone()).expect("checkpoint sha");
 
         // Ref parks the checkpoint; commit captures the WIP tree.
         assert_eq!(

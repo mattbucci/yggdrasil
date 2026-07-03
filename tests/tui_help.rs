@@ -32,7 +32,7 @@ fn global_keymap_lists_quit_and_navigation() {
     assert!(keys.iter().any(|k| k.contains("Tab")), "missing nav");
     assert!(keys.iter().any(|k| k.contains("?")), "missing self-toggle");
     assert!(
-        keys.iter().any(|k| *k == "1,2,3,5,9,0,G,N,C"),
+        keys.contains(&"1,2,3,5,9,0,G,N,C"),
         "missing exact switch-view key legend"
     );
 }

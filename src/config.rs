@@ -3,6 +3,10 @@ use std::env;
 /// Application configuration loaded from environment variables.
 #[derive(Debug, Clone)]
 pub struct AppConfig {
+    /// SQLite database location: either a `sqlite://` URL or a plain path.
+    /// Resolved from `YGG_DB_PATH` > `DATABASE_URL` > the XDG default
+    /// (`$XDG_DATA_HOME/ygg/ygg.db`, fallback `~/.local/share/ygg/ygg.db`).
+    /// Never required in the environment.
     pub database_url: String,
     pub context_limit_tokens: usize,
     pub context_hard_cap_tokens: usize,
@@ -24,8 +28,7 @@ impl AppConfig {
         }
 
         Ok(Self {
-            database_url: env::var("DATABASE_URL")
-                .map_err(|_| crate::YggError::Config("DATABASE_URL not set".into()))?,
+            database_url: crate::db::resolve_database_url(),
             context_limit_tokens: env::var("CONTEXT_LIMIT_TOKENS")
                 .unwrap_or_else(|_| "250000".into())
                 .parse()

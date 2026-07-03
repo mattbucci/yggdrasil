@@ -1,7 +1,6 @@
 //! Regression for attention-item label formatting + counting (yggdrasil-130).
 
 use chrono::Utc;
-use uuid::Uuid;
 use ygg::tui::attention::{
     AttentionItem, AttentionKind, NUDGE_THRESHOLD, WAITING_TOOL_THRESHOLD_SECS, count, item_label,
 };
@@ -27,7 +26,7 @@ fn awaiting_review_label_carries_task_ref() {
         since: Utc::now(),
         kind: AttentionKind::RunAwaitingReview {
             task_ref: "yggdrasil-42".into(),
-            run_id: Uuid::nil(),
+            run_id: String::new(),
         },
     };
     let label = item_label(&i);
@@ -63,7 +62,7 @@ fn count_returns_slice_length() {
             since: Utc::now(),
             kind: AttentionKind::RunAwaitingReview {
                 task_ref: "t-1".into(),
-                run_id: Uuid::nil(),
+                run_id: String::new(),
             },
         },
     ];

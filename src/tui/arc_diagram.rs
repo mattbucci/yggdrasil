@@ -8,18 +8,17 @@
 //! heights) layers on top.
 
 use std::collections::{HashMap, HashSet};
-use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DagNode {
-    pub task_id: Uuid,
+    pub task_id: String,
     pub label: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DagEdge {
-    pub from: Uuid,
-    pub to: Uuid,
+    pub from: String,
+    pub to: String,
 }
 
 /// Position of one task on the rendered axis: depth = how many edges
@@ -37,17 +36,17 @@ pub struct NodePosition {
 /// returns whatever it managed to assign so the renderer can still
 /// surface partial state. Cycle detection elsewhere (yggdrasil-122)
 /// catches those before they reach this layer.
-pub fn longest_path_depths(nodes: &[DagNode], edges: &[DagEdge]) -> HashMap<Uuid, u32> {
-    let mut depths: HashMap<Uuid, u32> = HashMap::new();
-    let parents_of: HashMap<Uuid, Vec<Uuid>> = {
-        let mut m: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+pub fn longest_path_depths(nodes: &[DagNode], edges: &[DagEdge]) -> HashMap<String, u32> {
+    let mut depths: HashMap<String, u32> = HashMap::new();
+    let parents_of: HashMap<String, Vec<String>> = {
+        let mut m: HashMap<String, Vec<String>> = HashMap::new();
         for e in edges {
-            m.entry(e.to).or_default().push(e.from);
+            m.entry(e.to.clone()).or_default().push(e.from.clone());
         }
         m
     };
 
-    let mut to_visit: Vec<Uuid> = nodes.iter().map(|n| n.task_id).collect();
+    let mut to_visit: Vec<String> = nodes.iter().map(|n| n.task_id.clone()).collect();
     let mut last_progress = to_visit.len() + 1;
     while !to_visit.is_empty() && last_progress != to_visit.len() {
         last_progress = to_visit.len();
@@ -71,7 +70,7 @@ pub fn longest_path_depths(nodes: &[DagNode], edges: &[DagEdge]) -> HashMap<Uuid
             };
             match max_parent {
                 Some(d) => {
-                    depths.insert(*id, d);
+                    depths.insert(id.clone(), d);
                     false
                 }
                 None => true,
@@ -86,15 +85,15 @@ pub fn longest_path_depths(nodes: &[DagNode], edges: &[DagEdge]) -> HashMap<Uuid
 /// stable in the input order so a refresh doesn't reshuffle.
 pub fn assign_positions(
     nodes: &[DagNode],
-    depths: &HashMap<Uuid, u32>,
-) -> HashMap<Uuid, NodePosition> {
-    let mut positions: HashMap<Uuid, NodePosition> = HashMap::new();
+    depths: &HashMap<String, u32>,
+) -> HashMap<String, NodePosition> {
+    let mut positions: HashMap<String, NodePosition> = HashMap::new();
     let mut tier_offset: HashMap<u32, u32> = HashMap::new();
     for n in nodes {
         let d = depths.get(&n.task_id).copied().unwrap_or(0);
         let col = tier_offset.entry(d).or_insert(0);
         positions.insert(
-            n.task_id,
+            n.task_id.clone(),
             NodePosition {
                 depth: d,
                 column: *col,
@@ -108,33 +107,36 @@ pub fn assign_positions(
 /// Critical path — longest chain by depth count. Returns the task IDs
 /// in path order. Used by the renderer to bold-style the arcs along
 /// this chain so the eye finds it instantly.
-pub fn critical_path(nodes: &[DagNode], edges: &[DagEdge]) -> Vec<Uuid> {
+pub fn critical_path(nodes: &[DagNode], edges: &[DagEdge]) -> Vec<String> {
     let depths = longest_path_depths(nodes, edges);
-    let parents_of: HashMap<Uuid, Vec<Uuid>> = {
-        let mut m: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+    let parents_of: HashMap<String, Vec<String>> = {
+        let mut m: HashMap<String, Vec<String>> = HashMap::new();
         for e in edges {
-            m.entry(e.to).or_default().push(e.from);
+            m.entry(e.to.clone()).or_default().push(e.from.clone());
         }
         m
     };
     // Walk back from the deepest node. Ties broken by node order.
-    let deepest = depths.iter().max_by_key(|(_, d)| **d).map(|(id, _)| *id);
+    let deepest = depths
+        .iter()
+        .max_by_key(|(_, d)| **d)
+        .map(|(id, _)| id.clone());
     let Some(start) = deepest else {
         return Vec::new();
     };
-    let mut path: Vec<Uuid> = vec![start];
+    let mut path: Vec<String> = vec![start.clone()];
     let mut cur = start;
-    let mut visited: HashSet<Uuid> = HashSet::new();
-    visited.insert(cur);
+    let mut visited: HashSet<String> = HashSet::new();
+    visited.insert(cur.clone());
     while let Some(parents) = parents_of.get(&cur) {
         if let Some(next) = parents
             .iter()
             .filter(|p| !visited.contains(*p))
             .max_by_key(|p| depths.get(*p).copied().unwrap_or(0))
         {
-            path.push(*next);
-            visited.insert(*next);
-            cur = *next;
+            path.push(next.clone());
+            visited.insert(next.clone());
+            cur = next.clone();
         } else {
             break;
         }

@@ -1,7 +1,7 @@
 //! Spinner widget + per-pane pending state (yggdrasil-154).
 //!
 //! Today every pane refreshes synchronously inside the render loop —
-//! a slow Postgres query freezes the whole UI. The plan (laid out in
+//! a slow database query freezes the whole UI. The plan (laid out in
 //! the orchestrator-pattern research) is to move every refresh to a
 //! `tokio::spawn` returning over an mpsc channel; while the result is
 //! pending, the pane shows a braille spinner in its title bar so the

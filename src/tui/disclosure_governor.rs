@@ -85,10 +85,10 @@ impl DisclosureGovernor {
             return false;
         }
         // Global cooldown.
-        if let Some(last) = self.fires.back() {
-            if now.duration_since(*last) < GLOBAL_COOLDOWN {
-                return false;
-            }
+        if let Some(last) = self.fires.back()
+            && now.duration_since(*last) < GLOBAL_COOLDOWN
+        {
+            return false;
         }
 
         // Per-sender refractory + threshold check.

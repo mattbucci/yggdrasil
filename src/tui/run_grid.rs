@@ -8,10 +8,9 @@
 
 use std::collections::BTreeMap;
 
+use crate::db::DbPool;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
-use sqlx::PgPool;
-use uuid::Uuid;
 
 /// One cell in the grid: either a recorded attempt or an empty slot
 /// (the task has fewer than `MAX_ATTEMPT_COLS` recorded runs).
@@ -124,18 +123,18 @@ impl RunGridView {
         self.state.select(Some(i.saturating_sub(1)));
     }
 
-    pub async fn refresh(&mut self, pool: &PgPool) -> Result<(), anyhow::Error> {
+    pub async fn refresh(&mut self, pool: &DbPool) -> Result<(), anyhow::Error> {
         self.loaded = true;
         // Pull every recent run for tasks that have at least one row in
         // the last 7 days. ORDER BY task_id, attempt DESC so we can take
         // the first MAX_ATTEMPT_COLS per task in a single pass.
-        let rows: Vec<(Uuid, String, i32, String, i32, String)> = sqlx::query_as(
+        let rows: Vec<(String, String, i32, String, i32, String)> = sqlx::query_as(
             r#"
-            SELECT t.task_id, r.task_prefix, t.seq, t.title, tr.attempt, tr.state::text
+            SELECT t.task_id, r.task_prefix, t.seq, t.title, tr.attempt, tr.state
               FROM task_runs tr
               JOIN tasks t ON t.task_id = tr.task_id
               JOIN repos r ON r.repo_id = t.repo_id
-             WHERE tr.scheduled_at > now() - interval '7 days'
+             WHERE tr.scheduled_at > strftime('%Y-%m-%dT%H:%M:%f+00:00','now','-7 days')
              ORDER BY t.task_id,
                       tr.attempt DESC
             "#,
@@ -146,7 +145,7 @@ impl RunGridView {
         // Group by task_id, pick the most-recent attempt timestamp as
         // the row's sort key (we already ordered by attempt DESC inside
         // each group, so the first row's attempt is the freshest).
-        let mut by_task: BTreeMap<Uuid, GridRow> = BTreeMap::new();
+        let mut by_task: BTreeMap<String, GridRow> = BTreeMap::new();
         for (task_id, prefix, seq, title, attempt, state_str) in rows {
             let state = GridState::parse(&state_str);
             let entry = by_task.entry(task_id).or_insert_with(|| GridRow {

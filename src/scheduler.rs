@@ -11,17 +11,17 @@
 //! already-finalized and is therefore safe to run alongside manual workflows.
 
 use crate::config::AppConfig;
+use crate::db::DbPool;
 use crate::models::event::{EventKind, EventRepo};
 use crate::models::task_run::{RunReason, RunState, idempotency_key_for};
 use serde::{Deserialize, Serialize};
-use sqlx::PgPool;
 use std::time::Duration;
-use uuid::Uuid;
 
-/// Scheduler advisory-lock id. `pg_try_advisory_lock(SCHEDULER_LOCK_ID)` at
-/// startup gives us the singleton invariant; concurrent attempts fail fast
-/// with a visible error.
-const SCHEDULER_LOCK_ID: i64 = 0x4347_4753_4348; // "GGSCH"
+/// Scheduler singleton lock file name, created beside the SQLite database.
+/// An exclusive flock() on it at startup gives us the singleton invariant;
+/// concurrent attempts fail fast with a visible error. (This replaces the
+/// Postgres advisory lock from the pre-SQLite era.)
+const SCHEDULER_LOCK_FILE: &str = "ygg.scheduler.lock";
 
 #[derive(Debug, Clone)]
 pub struct SchedulerConfig {
@@ -92,7 +92,7 @@ pub struct TickStats {
 
 /// Run one scheduler tick. Public so `ygg scheduler tick` can call it
 /// synchronously for testing without spinning up the daemon loop.
-pub async fn tick(pool: &PgPool, cfg: &SchedulerConfig) -> Result<TickStats, anyhow::Error> {
+pub async fn tick(pool: &DbPool, cfg: &SchedulerConfig) -> Result<TickStats, anyhow::Error> {
     let mut stats = TickStats::default();
     stats.reaped = reap_expired_heartbeats(pool).await?;
     stats.deadlined = enforce_deadlines(pool).await?;
@@ -101,8 +101,8 @@ pub async fn tick(pool: &PgPool, cfg: &SchedulerConfig) -> Result<TickStats, any
     // parent task when the latest attempt is terminal; schedule_retries' guard
     // is `WHERE t.status <> 'closed'`, so reversing this order silently kills
     // retry. If a retry queues a fresh `ready` attempt, finalize then sees a
-    // non-terminal latest attempt and skips the task (DISTINCT ON ... ORDER BY
-    // attempt DESC).
+    // non-terminal latest attempt and skips the task (latest-terminal-run
+    // GROUP BY in finalize_terminal_runs).
     stats.retried = schedule_retries(pool, cfg).await?;
     stats.finalized = finalize_terminal_runs(pool).await?;
     stats.scheduled = schedule_ready_tasks(pool, cfg).await?;
@@ -110,9 +110,9 @@ pub async fn tick(pool: &PgPool, cfg: &SchedulerConfig) -> Result<TickStats, any
     Ok(stats)
 }
 
-/// Run the scheduler loop until shutdown. Holds the singleton advisory lock
-/// for the lifetime of the connection.
-pub async fn run(pool: PgPool, cfg: SchedulerConfig) -> Result<(), anyhow::Error> {
+/// Run the scheduler loop until shutdown. Holds the singleton file lock
+/// (and the event-bus socket) for the lifetime of the process.
+pub async fn run(pool: DbPool, cfg: SchedulerConfig) -> Result<(), anyhow::Error> {
     let _guard = acquire_advisory_lock(&pool).await?;
     tracing::info!(
         tick_ms = cfg.tick_interval.as_millis() as u64,
@@ -130,10 +130,19 @@ pub async fn run(pool: PgPool, cfg: SchedulerConfig) -> Result<(), anyhow::Error
     .await
     .ok();
 
+    // Event-bus wake-up (unix datagram socket): CLI one-shots and hooks fire
+    // best-effort datagrams; a received event cuts the wait short so work
+    // dispatches immediately. The periodic tick remains the delivery safety
+    // net — a dropped datagram only costs one tick of latency.
+    let bus = crate::bus::BusListener::bind()
+        .map_err(|e| {
+            tracing::debug!(error = %e, "event bus unavailable; running on timer only");
+            e
+        })
+        .ok();
+
     loop {
-        // Sleep + ctrl-c handling. LISTEN/NOTIFY wake-up lands per yggdrasil-99
-        // (it requires a dedicated listener task; for MVP a simple sleep is
-        // fine — the tick interval defaults to 2s).
+        // Sleep + ctrl-c handling; the bus (when bound) can wake us early.
         let sleep = tokio::time::sleep(cfg.tick_interval);
         tokio::pin!(sleep);
         tokio::select! {
@@ -142,6 +151,12 @@ pub async fn run(pool: PgPool, cfg: SchedulerConfig) -> Result<(), anyhow::Error
                 break;
             }
             _ = &mut sleep => {}
+            _event = async {
+                match &bus {
+                    Some(b) => b.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {}
         }
 
         match tick(&pool, &cfg).await {
@@ -191,20 +206,20 @@ pub async fn run(pool: PgPool, cfg: SchedulerConfig) -> Result<(), anyhow::Error
 /// status is still in_progress, and close the task accordingly. Idempotent.
 /// Stage 1 only: succeeded → closed; failed/crashed → closed with reason
 /// "failed" (no retry yet — that's yggdrasil-99).
-pub async fn finalize_terminal_runs(pool: &PgPool) -> Result<i64, anyhow::Error> {
-    // Pull the latest run per task where state is terminal and the task
-    // hasn't been closed yet. We skip-locked so concurrent runs of `tick`
-    // (shouldn't happen; advisory lock — but be safe) cooperate.
-    // No FOR UPDATE: finalize is idempotent (concurrent ticks would do the
-    // same UPDATE harmlessly). FOR UPDATE on a CTE isn't allowed in pg anyway.
-    let rows: Vec<(Uuid, RunState, RunReason, i32, Option<String>)> = sqlx::query_as(
-        r#"SELECT DISTINCT ON (tr.task_id)
-                  tr.task_id, tr.state, tr.reason, tr.attempt, tr.output_commit_sha
+pub async fn finalize_terminal_runs(pool: &DbPool) -> Result<i64, anyhow::Error> {
+    // Pull the latest terminal run per task where the task hasn't been
+    // closed yet. Finalize is idempotent (a repeated tick would do the same
+    // UPDATE harmlessly), and the file lock guarantees a single scheduler.
+    // SQLite: MAX(attempt) with bare columns selects the row of the max —
+    // the documented replacement for Postgres DISTINCT ON.
+    let rows: Vec<(String, RunState, RunReason, i32, Option<String>)> = sqlx::query_as(
+        r#"SELECT tr.task_id, tr.state, tr.reason, MAX(tr.attempt) AS attempt,
+                  tr.output_commit_sha
              FROM task_runs tr
              JOIN tasks t ON t.task_id = tr.task_id
             WHERE tr.state IN ('succeeded', 'failed', 'crashed', 'cancelled', 'poison')
               AND t.status IN ('open', 'in_progress')
-            ORDER BY tr.task_id, tr.attempt DESC
+            GROUP BY tr.task_id
             LIMIT 100"#,
     )
     .fetch_all(pool)
@@ -225,14 +240,14 @@ pub async fn finalize_terminal_runs(pool: &PgPool) -> Result<i64, anyhow::Error>
         sqlx::query(
             r#"UPDATE tasks
                SET status = 'closed',
-                   closed_at = COALESCE(closed_at, now()),
+                   closed_at = COALESCE(closed_at, strftime('%Y-%m-%dT%H:%M:%f+00:00','now')),
                    close_reason = $2,
                    current_attempt_id = NULL,
                    result_blob_ref = COALESCE(result_blob_ref, $3),
-                   updated_at = now()
+                   updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now')
                WHERE task_id = $1"#,
         )
-        .bind(task_id)
+        .bind(&task_id)
         .bind(&close_reason)
         .bind(commit.as_deref())
         .execute(&mut *tx)
@@ -240,7 +255,7 @@ pub async fn finalize_terminal_runs(pool: &PgPool) -> Result<i64, anyhow::Error>
         sqlx::query(
             "INSERT INTO task_events (task_id, kind, payload) VALUES ($1, 'status_change', $2)",
         )
-        .bind(task_id)
+        .bind(&task_id)
         .bind(serde_json::json!({
             "to": "closed",
             "by": "scheduler",
@@ -262,10 +277,10 @@ pub async fn finalize_terminal_runs(pool: &PgPool) -> Result<i64, anyhow::Error>
 /// where the scheduler "owns" the queue: turning runnable tasks into ready
 /// runs that dispatch_ready() will pick up next.
 pub async fn schedule_ready_tasks(
-    pool: &PgPool,
+    pool: &DbPool,
     cfg: &SchedulerConfig,
 ) -> Result<i64, anyhow::Error> {
-    let rows: Vec<(Uuid, Option<i32>, Option<i64>)> = sqlx::query_as(
+    let rows: Vec<(String, Option<i32>, Option<i64>)> = sqlx::query_as(
         r#"SELECT t.task_id, t.max_attempts, t.timeout_ms
              FROM tasks t
             WHERE t.runnable = TRUE
@@ -288,7 +303,6 @@ pub async fn schedule_ready_tasks(
               -- yggdrasil-109: $1 short-circuits the gate when YGG_AUTO_APPROVE.
               AND ($1 OR t.approval_level = 'auto' OR t.approved_at IS NOT NULL)
             ORDER BY t.priority, t.updated_at
-            FOR UPDATE OF t SKIP LOCKED
             LIMIT 100"#,
     )
     .bind(cfg.auto_approve)
@@ -299,7 +313,7 @@ pub async fn schedule_ready_tasks(
     for (task_id, max_attempts, timeout_ms) in rows {
         let prev_attempt: Option<i32> =
             sqlx::query_scalar("SELECT MAX(attempt) FROM task_runs WHERE task_id = $1")
-                .bind(task_id)
+                .bind(&task_id)
                 .fetch_one(pool)
                 .await
                 .ok()
@@ -310,10 +324,10 @@ pub async fn schedule_ready_tasks(
         let deadline =
             timeout_ms.map(|ms| chrono::Utc::now() + chrono::Duration::milliseconds(ms.max(0)));
 
-        let key = idempotency_key_for(task_id, attempt);
+        let key = idempotency_key_for(&task_id, attempt);
         // Insert directly as 'ready'. If we crash mid-tick the row is on disk
         // and the next tick picks it up via dispatch_ready.
-        let row: Option<Uuid> = sqlx::query_scalar(
+        let row: Option<String> = sqlx::query_scalar(
             r#"INSERT INTO task_runs
                (task_id, attempt, idempotency_key, state, max_attempts,
                 heartbeat_ttl_s, deadline_at, input)
@@ -321,7 +335,7 @@ pub async fn schedule_ready_tasks(
                ON CONFLICT (idempotency_key) DO NOTHING
                RETURNING run_id"#,
         )
-        .bind(task_id)
+        .bind(&task_id)
         .bind(attempt)
         .bind(&key)
         .bind(max)
@@ -333,7 +347,7 @@ pub async fn schedule_ready_tasks(
 
         if let Some(run_id) = row {
             scheduled += 1;
-            let task_ref = task_ref_for(pool, task_id)
+            let task_ref = task_ref_for(pool, &task_id)
                 .await
                 .unwrap_or_else(|| task_id.to_string());
             EventRepo::new(pool)
@@ -357,30 +371,30 @@ pub async fn schedule_ready_tasks(
 /// (Stage 2) Mark running runs whose heartbeat is past TTL as crashed.
 /// PreToolUse hook bumps heartbeat_at on every tool call, so a quiet run
 /// past the TTL is genuinely stuck (tmux dead, claude killed, OS evicted).
-pub async fn reap_expired_heartbeats(pool: &PgPool) -> Result<i64, anyhow::Error> {
-    let rows: Vec<(Uuid, Uuid, i32, Option<Uuid>)> = sqlx::query_as(
+pub async fn reap_expired_heartbeats(pool: &DbPool) -> Result<i64, anyhow::Error> {
+    let rows: Vec<(String, String, i32, Option<String>)> = sqlx::query_as(
         r#"UPDATE task_runs
               SET state = 'crashed',
                   reason = 'heartbeat_timeout',
-                  ended_at = COALESCE(ended_at, now()),
-                  updated_at = now()
+                  ended_at = COALESCE(ended_at, strftime('%Y-%m-%dT%H:%M:%f+00:00','now')),
+                  updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now')
             WHERE state = 'running'
               AND heartbeat_at IS NOT NULL
-              AND heartbeat_at < now() - (heartbeat_ttl_s || ' seconds')::interval
+              AND heartbeat_at < strftime('%Y-%m-%dT%H:%M:%f+00:00','now','-' || heartbeat_ttl_s || ' seconds')
         RETURNING run_id, task_id, attempt, agent_id"#,
     )
     .fetch_all(pool)
     .await?;
 
     for (run_id, task_id, attempt, agent_id) in &rows {
-        let task_ref = task_ref_for(pool, *task_id)
+        let task_ref = task_ref_for(pool, task_id)
             .await
             .unwrap_or_else(|| task_id.to_string());
         EventRepo::new(pool)
             .emit(
                 EventKind::RunTerminal,
                 "scheduler",
-                *agent_id,
+                agent_id.clone(),
                 serde_json::json!({
                     "task_ref": task_ref,
                     "run_id": run_id,
@@ -399,23 +413,23 @@ pub async fn reap_expired_heartbeats(pool: &PgPool) -> Result<i64, anyhow::Error
 /// (Stage 2) Enforce deadlines on running runs. A deadline_at in the past
 /// transitions the run to cancelled with reason=timeout. Forceful: the
 /// scheduler does not currently signal the agent — that's a follow-up.
-pub async fn enforce_deadlines(pool: &PgPool) -> Result<i64, anyhow::Error> {
-    let rows: Vec<(Uuid, Uuid, i32)> = sqlx::query_as(
+pub async fn enforce_deadlines(pool: &DbPool) -> Result<i64, anyhow::Error> {
+    let rows: Vec<(String, String, i32)> = sqlx::query_as(
         r#"UPDATE task_runs
               SET state = 'cancelled',
                   reason = 'timeout',
-                  ended_at = COALESCE(ended_at, now()),
-                  updated_at = now()
+                  ended_at = COALESCE(ended_at, strftime('%Y-%m-%dT%H:%M:%f+00:00','now')),
+                  updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now')
             WHERE state = 'running'
               AND deadline_at IS NOT NULL
-              AND deadline_at < now()
+              AND deadline_at < strftime('%Y-%m-%dT%H:%M:%f+00:00','now')
         RETURNING run_id, task_id, attempt"#,
     )
     .fetch_all(pool)
     .await?;
 
     for (run_id, task_id, attempt) in &rows {
-        let task_ref = task_ref_for(pool, *task_id)
+        let task_ref = task_ref_for(pool, task_id)
             .await
             .unwrap_or_else(|| task_id.to_string());
         EventRepo::new(pool)
@@ -474,22 +488,27 @@ fn compute_fingerprint(
 
 /// (Stage 3) Compute fingerprints for terminal runs that haven't been
 /// fingerprinted yet, and poison tasks with N consecutive matching prints.
-pub async fn detect_loops(pool: &PgPool, threshold: i32) -> Result<i64, anyhow::Error> {
+pub async fn detect_loops(pool: &DbPool, threshold: i32) -> Result<i64, anyhow::Error> {
     // 1. Backfill fingerprints for any terminal run missing one.
-    let pending: Vec<(Uuid, Uuid, RunState, RunReason, Option<serde_json::Value>)> =
-        sqlx::query_as(
-            r#"SELECT r.run_id, r.task_id, r.state, r.reason, r.error
+    let pending: Vec<(
+        String,
+        String,
+        RunState,
+        RunReason,
+        Option<serde_json::Value>,
+    )> = sqlx::query_as(
+        r#"SELECT r.run_id, r.task_id, r.state, r.reason, r.error
              FROM task_runs r
             WHERE r.fingerprint IS NULL
               AND r.state IN ('failed', 'crashed', 'cancelled', 'succeeded')"#,
-        )
-        .fetch_all(pool)
-        .await?;
+    )
+    .fetch_all(pool)
+    .await?;
 
     for (run_id, task_id, state, reason, error) in pending {
         let task_meta: Option<(String, Option<String>, String)> =
-            sqlx::query_as("SELECT title, acceptance, kind::text FROM tasks WHERE task_id = $1")
-                .bind(task_id)
+            sqlx::query_as("SELECT title, acceptance, kind FROM tasks WHERE task_id = $1")
+                .bind(&task_id)
                 .fetch_optional(pool)
                 .await?;
         let Some((title, acceptance, kind)) = task_meta else {
@@ -509,7 +528,7 @@ pub async fn detect_loops(pool: &PgPool, threshold: i32) -> Result<i64, anyhow::
             msg.as_deref(),
         );
         sqlx::query("UPDATE task_runs SET fingerprint = $2 WHERE run_id = $1")
-            .bind(run_id)
+            .bind(&run_id)
             .bind(fp)
             .execute(pool)
             .await?;
@@ -517,7 +536,7 @@ pub async fn detect_loops(pool: &PgPool, threshold: i32) -> Result<i64, anyhow::
 
     // 2. For each task, look at its last `threshold` failure-shaped runs.
     //    If their fingerprints all match, poison the task.
-    let candidates: Vec<(Uuid,)> = sqlx::query_as(
+    let candidates: Vec<(String,)> = sqlx::query_as(
         r#"SELECT DISTINCT t.task_id
              FROM tasks t
              JOIN task_runs r USING (task_id)
@@ -539,7 +558,7 @@ pub async fn detect_loops(pool: &PgPool, threshold: i32) -> Result<i64, anyhow::
                 ORDER BY attempt DESC
                 LIMIT $2"#,
         )
-        .bind(task_id)
+        .bind(&task_id)
         .bind(threshold as i64)
         .fetch_all(pool)
         .await?;
@@ -555,10 +574,10 @@ pub async fn detect_loops(pool: &PgPool, threshold: i32) -> Result<i64, anyhow::
         let mut tx = pool.begin().await?;
         sqlx::query(
             r#"UPDATE task_runs
-                  SET state = 'poison', reason = 'loop_detected', updated_at = now()
+                  SET state = 'poison', reason = 'loop_detected', updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now')
                 WHERE task_id = $1 AND state IN ('failed', 'crashed', 'retrying')"#,
         )
-        .bind(task_id)
+        .bind(&task_id)
         .execute(&mut *tx)
         .await?;
         sqlx::query(
@@ -566,16 +585,16 @@ pub async fn detect_loops(pool: &PgPool, threshold: i32) -> Result<i64, anyhow::
                   SET status = 'blocked',
                       close_reason = 'poison: loop_detected (' || $2 || ' identical failures)',
                       current_attempt_id = NULL,
-                      updated_at = now()
+                      updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now')
                 WHERE task_id = $1"#,
         )
-        .bind(task_id)
+        .bind(&task_id)
         .bind(threshold)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
 
-        let task_ref = task_ref_for(pool, task_id)
+        let task_ref = task_ref_for(pool, &task_id)
             .await
             .unwrap_or_else(|| task_id.to_string());
         EventRepo::new(pool)
@@ -602,9 +621,9 @@ pub async fn detect_loops(pool: &PgPool, threshold: i32) -> Result<i64, anyhow::
 /// global per-host cap. Returns the run_ids the scheduler may dispatch this
 /// tick. Default per-repo cap is 3; per-epic cap matches.
 pub async fn dispatchable_under_budgets(
-    pool: &PgPool,
+    pool: &DbPool,
     cfg: &SchedulerConfig,
-) -> Result<Vec<Uuid>, anyhow::Error> {
+) -> Result<Vec<String>, anyhow::Error> {
     let live: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_runs WHERE state = 'running'")
         .fetch_one(pool)
         .await?;
@@ -616,7 +635,7 @@ pub async fn dispatchable_under_budgets(
     // Pick ready runs ordered by priority + age, then filter by per-repo and
     // per-epic budgets. Could be done in SQL but the cap math is clearer in
     // Rust and the candidate set is small (host_budget rows max).
-    let candidates: Vec<(Uuid, Uuid, Uuid)> = sqlx::query_as(
+    let candidates: Vec<(String, String, String)> = sqlx::query_as(
         r#"SELECT tr.run_id, t.task_id, t.repo_id
              FROM task_runs tr
              JOIN tasks t USING (task_id)
@@ -643,15 +662,15 @@ pub async fn dispatchable_under_budgets(
         .and_then(|s| s.parse::<i64>().ok())
         .unwrap_or(3);
 
-    let per_repo_live: Vec<(Uuid, i64)> = sqlx::query_as(
-        r#"SELECT t.repo_id, COUNT(*)::bigint
+    let per_repo_live: Vec<(String, i64)> = sqlx::query_as(
+        r#"SELECT t.repo_id, COUNT(*)
              FROM task_runs r JOIN tasks t USING (task_id)
             WHERE r.state = 'running'
             GROUP BY t.repo_id"#,
     )
     .fetch_all(pool)
     .await?;
-    let mut repo_used: std::collections::HashMap<Uuid, i64> = per_repo_live.into_iter().collect();
+    let mut repo_used: std::collections::HashMap<String, i64> = per_repo_live.into_iter().collect();
 
     let mut chosen = Vec::new();
     for (run_id, _task_id, repo_id) in candidates {
@@ -671,11 +690,11 @@ pub async fn dispatchable_under_budgets(
 /// `ygg task unpoison <ref>` — clear the poison state and let the scheduler
 /// retry. Resets the latest run's state to allow retries within max_attempts;
 /// flips task.status back to open.
-pub async fn unpoison(pool: &PgPool, task_id: Uuid) -> Result<(), anyhow::Error> {
+pub async fn unpoison(pool: &DbPool, task_id: &str) -> Result<(), anyhow::Error> {
     let mut tx = pool.begin().await?;
     sqlx::query(
         r#"UPDATE task_runs
-              SET state = 'failed', reason = 'agent_error', updated_at = now()
+              SET state = 'failed', reason = 'agent_error', updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now')
             WHERE task_id = $1 AND state = 'poison'"#,
     )
     .bind(task_id)
@@ -686,7 +705,7 @@ pub async fn unpoison(pool: &PgPool, task_id: Uuid) -> Result<(), anyhow::Error>
               SET status = 'open',
                   close_reason = NULL,
                   closed_at = NULL,
-                  updated_at = now()
+                  updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now')
             WHERE task_id = $1 AND status = 'blocked'"#,
     )
     .bind(task_id)
@@ -699,15 +718,15 @@ pub async fn unpoison(pool: &PgPool, task_id: Uuid) -> Result<(), anyhow::Error>
 /// `ygg task approve <ref>` — mark the task as approved. Tasks with
 /// approval_level=approve_plan stay in 'ready' until approved_at is set.
 pub async fn approve(
-    pool: &PgPool,
-    task_id: Uuid,
-    approver: Option<Uuid>,
+    pool: &DbPool,
+    task_id: &str,
+    approver: Option<String>,
 ) -> Result<(), anyhow::Error> {
     sqlx::query(
         r#"UPDATE tasks
-              SET approved_at = now(),
+              SET approved_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now'),
                   approved_by_agent_id = $2,
-                  updated_at = now()
+                  updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now')
             WHERE task_id = $1"#,
     )
     .bind(task_id)
@@ -721,10 +740,10 @@ pub async fn approve(
 /// haven't already produced a successor, insert a new attempt row. The
 /// previous attempt's error gets threaded into input.previous_attempt so the
 /// retry agent can avoid the same failure mode.
-pub async fn schedule_retries(pool: &PgPool, cfg: &SchedulerConfig) -> Result<i64, anyhow::Error> {
+pub async fn schedule_retries(pool: &DbPool, cfg: &SchedulerConfig) -> Result<i64, anyhow::Error> {
     let candidates: Vec<(
-        Uuid,
-        Uuid,
+        String,
+        String,
         i32,
         i32,
         RunReason,
@@ -780,7 +799,7 @@ pub async fn schedule_retries(pool: &PgPool, cfg: &SchedulerConfig) -> Result<i6
         }
 
         let next_attempt = attempt + 1;
-        let key = idempotency_key_for(task_id, next_attempt);
+        let key = idempotency_key_for(&task_id, next_attempt);
 
         // Thread previous attempt summary forward.
         let mut next_input = input.clone();
@@ -799,7 +818,7 @@ pub async fn schedule_retries(pool: &PgPool, cfg: &SchedulerConfig) -> Result<i6
         let deadline =
             timeout_ms.map(|ms| chrono::Utc::now() + chrono::Duration::milliseconds(ms.max(0)));
 
-        let new_run: Option<Uuid> = sqlx::query_scalar(
+        let new_run: Option<String> = sqlx::query_scalar(
             r#"INSERT INTO task_runs
                (task_id, attempt, parent_run_id, idempotency_key, state,
                 heartbeat_ttl_s, deadline_at, input)
@@ -807,9 +826,9 @@ pub async fn schedule_retries(pool: &PgPool, cfg: &SchedulerConfig) -> Result<i6
                ON CONFLICT (idempotency_key) DO NOTHING
                RETURNING run_id"#,
         )
-        .bind(task_id)
+        .bind(&task_id)
         .bind(next_attempt)
-        .bind(run_id)
+        .bind(&run_id)
         .bind(&key)
         .bind(cfg.default_heartbeat_ttl_s)
         .bind(deadline)
@@ -822,13 +841,13 @@ pub async fn schedule_retries(pool: &PgPool, cfg: &SchedulerConfig) -> Result<i6
             // the new attempt starts. This gives `ygg task show` a clean
             // narrative ("attempt 1 failed → retrying → attempt 2 ...").
             sqlx::query(
-                "UPDATE task_runs SET state = 'retrying', updated_at = now() WHERE run_id = $1",
+                "UPDATE task_runs SET state = 'retrying', updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now') WHERE run_id = $1",
             )
-            .bind(run_id)
+            .bind(&run_id)
             .execute(pool)
             .await?;
 
-            let task_ref = task_ref_for(pool, task_id)
+            let task_ref = task_ref_for(pool, &task_id)
                 .await
                 .unwrap_or_else(|| task_id.to_string());
             EventRepo::new(pool)
@@ -895,37 +914,34 @@ fn compute_backoff_ms(strategy: &serde_json::Value, attempt: i32) -> i64 {
 }
 
 /// (3) Claim ready runs up to budget; spawn agents; bind run→agent.
-pub async fn dispatch_ready(pool: &PgPool, cfg: &SchedulerConfig) -> Result<i64, anyhow::Error> {
+pub async fn dispatch_ready(pool: &DbPool, cfg: &SchedulerConfig) -> Result<i64, anyhow::Error> {
     // Stage 3: budget = host - live, then filter through per-repo cap.
     let eligible = dispatchable_under_budgets(pool, cfg).await?;
     if eligible.is_empty() {
         return Ok(0);
     }
 
-    // The hot SKIP LOCKED claim. See docs/design/task-runs.md § the SKIP
-    // LOCKED claim query. We apply the budget filter via run_id IN list to
-    // avoid claiming more than the per-repo cap allows.
-    let claimed: Vec<(Uuid, Uuid, i32, serde_json::Value)> = sqlx::query_as(
-        r#"WITH picked AS (
-              SELECT tr.run_id
-                FROM task_runs tr
-               WHERE tr.run_id = ANY($1)
-                 AND tr.state = 'ready'
-               ORDER BY tr.scheduled_at
-               FOR UPDATE OF tr SKIP LOCKED
-           )
-           UPDATE task_runs
+    // The claim. Postgres used FOR UPDATE SKIP LOCKED here; on SQLite a
+    // single-host BEGIN IMMEDIATE transaction takes the write lock up front
+    // (busy_timeout + WAL absorb hook contention) and the atomic
+    // ready→running UPDATE keeps the claim idempotent.
+    let eligible_json = serde_json::to_string(&eligible).unwrap_or_else(|_| "[]".to_string());
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let claimed: Vec<(String, String, i32, serde_json::Value)> = sqlx::query_as(
+        r#"UPDATE task_runs
               SET state = 'running',
-                  claimed_at = now(),
-                  started_at = now(),
-                  heartbeat_at = now(),
-                  updated_at = now()
-            WHERE run_id IN (SELECT run_id FROM picked)
+                  claimed_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now'),
+                  started_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now'),
+                  heartbeat_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now'),
+                  updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now')
+            WHERE run_id IN (SELECT value FROM json_each($1))
+              AND state = 'ready'
         RETURNING run_id, task_id, attempt, input"#,
     )
-    .bind(&eligible)
-    .fetch_all(pool)
+    .bind(&eligible_json)
+    .fetch_all(&mut *tx)
     .await?;
+    tx.commit().await?;
 
     if claimed.is_empty() {
         return Ok(0);
@@ -941,17 +957,17 @@ pub async fn dispatch_ready(pool: &PgPool, cfg: &SchedulerConfig) -> Result<i64,
                  FROM tasks t JOIN repos r USING (repo_id)
                 WHERE t.task_id = $1"#,
         )
-        .bind(task_id)
+        .bind(&task_id)
         .fetch_optional(pool)
         .await?;
         let Some((title, prefix, seq, desc, agent_slug)) = row else {
             // Task vanished underneath us; mark crashed so we don't retry.
             sqlx::query(
                 "UPDATE task_runs SET state = 'crashed', reason = 'dependency_failed',
-                                       ended_at = now(), updated_at = now()
+                                       ended_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now'), updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now')
                   WHERE run_id = $1",
             )
-            .bind(run_id)
+            .bind(&run_id)
             .execute(pool)
             .await?;
             continue;
@@ -974,7 +990,7 @@ pub async fn dispatch_ready(pool: &PgPool, cfg: &SchedulerConfig) -> Result<i64,
             Ok(()) => {
                 // Bind the run to the agent we just registered (spawn::execute
                 // registers the agent before launching tmux).
-                let agent_id: Option<Uuid> =
+                let agent_id: Option<String> =
                     sqlx::query_scalar("SELECT agent_id FROM agents WHERE name = $1 LIMIT 1")
                         .bind(&agent_name)
                         .fetch_optional(pool)
@@ -983,17 +999,17 @@ pub async fn dispatch_ready(pool: &PgPool, cfg: &SchedulerConfig) -> Result<i64,
                         .flatten();
                 let mut tx = pool.begin().await?;
                 sqlx::query(
-                    "UPDATE task_runs SET agent_id = $2, updated_at = now() WHERE run_id = $1",
+                    "UPDATE task_runs SET agent_id = $2, updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now') WHERE run_id = $1",
                 )
-                .bind(run_id)
+                .bind(&run_id)
                 .bind(agent_id)
                 .execute(&mut *tx)
                 .await?;
                 sqlx::query(
-                    "UPDATE tasks SET current_attempt_id = $2, updated_at = now() WHERE task_id = $1",
+                    "UPDATE tasks SET current_attempt_id = $2, updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now') WHERE task_id = $1",
                 )
-                .bind(task_id)
-                .bind(run_id)
+                .bind(&task_id)
+                .bind(&run_id)
                 .execute(&mut *tx)
                 .await?;
                 tx.commit().await?;
@@ -1020,13 +1036,13 @@ pub async fn dispatch_ready(pool: &PgPool, cfg: &SchedulerConfig) -> Result<i64,
                     "UPDATE task_runs
                         SET state = 'crashed',
                             reason = 'tmux_gone',
-                            error = jsonb_build_object('reason_code', 'tmux_gone',
-                                                       'message', $2::text),
-                            ended_at = now(),
-                            updated_at = now()
+                            error = json_object('reason_code', 'tmux_gone',
+                                                'message', $2),
+                            ended_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now'),
+                            updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now')
                       WHERE run_id = $1",
                 )
-                .bind(run_id)
+                .bind(&run_id)
                 .bind(err.to_string())
                 .execute(pool)
                 .await?;
@@ -1062,11 +1078,11 @@ pub struct BackfillStats {
     pub skipped: i64,
 }
 
-pub async fn backfill(pool: &PgPool) -> Result<BackfillStats, anyhow::Error> {
+pub async fn backfill(pool: &DbPool) -> Result<BackfillStats, anyhow::Error> {
     let mut stats = BackfillStats::default();
 
     // In-progress tasks with no current_attempt_id and no existing run rows.
-    let in_progress: Vec<(Uuid, Option<Uuid>)> = sqlx::query_as(
+    let in_progress: Vec<(String, Option<String>)> = sqlx::query_as(
         r#"SELECT t.task_id, t.assignee
              FROM tasks t
             WHERE t.status = 'in_progress'
@@ -1077,23 +1093,23 @@ pub async fn backfill(pool: &PgPool) -> Result<BackfillStats, anyhow::Error> {
     .await?;
 
     for (task_id, assignee) in in_progress {
-        let key = idempotency_key_for(task_id, 1);
-        let row: Option<Uuid> = sqlx::query_scalar(
+        let key = idempotency_key_for(&task_id, 1);
+        let row: Option<String> = sqlx::query_scalar(
             r#"INSERT INTO task_runs
                (task_id, attempt, idempotency_key, state, agent_id,
                 started_at, heartbeat_at, claimed_at, scheduled_at)
-               VALUES ($1, 1, $2, 'running', $3, now(), now(), now(), now())
+               VALUES ($1, 1, $2, 'running', $3, strftime('%Y-%m-%dT%H:%M:%f+00:00','now'), strftime('%Y-%m-%dT%H:%M:%f+00:00','now'), strftime('%Y-%m-%dT%H:%M:%f+00:00','now'), strftime('%Y-%m-%dT%H:%M:%f+00:00','now'))
                ON CONFLICT (idempotency_key) DO NOTHING
                RETURNING run_id"#,
         )
-        .bind(task_id)
+        .bind(&task_id)
         .bind(&key)
         .bind(assignee)
         .fetch_optional(pool)
         .await?;
         if let Some(run_id) = row {
             sqlx::query("UPDATE tasks SET current_attempt_id = $2 WHERE task_id = $1")
-                .bind(task_id)
+                .bind(&task_id)
                 .bind(run_id)
                 .execute(pool)
                 .await?;
@@ -1106,38 +1122,41 @@ pub async fn backfill(pool: &PgPool) -> Result<BackfillStats, anyhow::Error> {
     // Closed tasks with no run rows. We can't reliably reconstruct the agent
     // or commit, so we leave those NULL — the row is mainly so `ygg task show`
     // displays "run #1 succeeded" for completeness.
-    let closed: Vec<(Uuid, Option<chrono::DateTime<chrono::Utc>>, Option<String>)> =
-        sqlx::query_as(
-            r#"SELECT t.task_id, t.closed_at, t.close_reason
+    let closed: Vec<(
+        String,
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<String>,
+    )> = sqlx::query_as(
+        r#"SELECT t.task_id, t.closed_at, t.close_reason
              FROM tasks t
             WHERE t.status = 'closed'
               AND NOT EXISTS (SELECT 1 FROM task_runs r WHERE r.task_id = t.task_id)
             LIMIT 5000"#,
-        )
-        .fetch_all(pool)
-        .await?;
+    )
+    .fetch_all(pool)
+    .await?;
 
     for (task_id, closed_at, reason) in closed {
-        let key = idempotency_key_for(task_id, 1);
+        let key = idempotency_key_for(&task_id, 1);
         let (state, run_reason) = match reason.as_deref() {
             Some(r) if r.to_ascii_lowercase().contains("crash") => ("crashed", "tmux_gone"),
             Some(r) if r.to_ascii_lowercase().contains("cancel") => ("cancelled", "user_cancelled"),
             Some(r) if r.to_ascii_lowercase().contains("fail") => ("failed", "agent_error"),
             _ => ("succeeded", "ok"),
         };
-        let row: Option<Uuid> = sqlx::query_scalar(
+        let row: Option<String> = sqlx::query_scalar(
             r#"INSERT INTO task_runs
                (task_id, attempt, idempotency_key, state, reason,
                 started_at, ended_at, scheduled_at)
                VALUES ($1, 1, $2,
-                       $3::text::run_state, $4::text::run_reason,
-                       COALESCE($5, now()) - interval '1 minute',
-                       COALESCE($5, now()),
-                       COALESCE($5, now()) - interval '1 minute')
+                       $3, $4,
+                       strftime('%Y-%m-%dT%H:%M:%f+00:00', COALESCE($5, 'now'), '-1 minute'),
+                       strftime('%Y-%m-%dT%H:%M:%f+00:00', COALESCE($5, 'now')),
+                       strftime('%Y-%m-%dT%H:%M:%f+00:00', COALESCE($5, 'now'), '-1 minute'))
                ON CONFLICT (idempotency_key) DO NOTHING
                RETURNING run_id"#,
         )
-        .bind(task_id)
+        .bind(&task_id)
         .bind(&key)
         .bind(state)
         .bind(run_reason)
@@ -1194,7 +1213,7 @@ fn recovery_note(input: &serde_json::Value) -> String {
     }
 }
 
-async fn task_ref_for(pool: &PgPool, task_id: Uuid) -> Option<String> {
+async fn task_ref_for(pool: &DbPool, task_id: &str) -> Option<String> {
     sqlx::query_as::<_, (String, i32)>(
         r#"SELECT r.task_prefix, t.seq FROM tasks t
            JOIN repos r USING (repo_id) WHERE t.task_id = $1"#,
@@ -1208,7 +1227,7 @@ async fn task_ref_for(pool: &PgPool, task_id: Uuid) -> Option<String> {
 }
 
 async fn emit_simple_event(
-    pool: &PgPool,
+    pool: &DbPool,
     kind: EventKind,
     payload: serde_json::Value,
 ) -> Result<(), sqlx::Error> {
@@ -1217,24 +1236,43 @@ async fn emit_simple_event(
         .await
 }
 
-/// Acquire the singleton advisory lock. Returned guard auto-releases on drop
-/// (which closes the connection it holds). A second instance fails fast.
-pub async fn acquire_advisory_lock(pool: &PgPool) -> Result<AdvisoryLockGuard, anyhow::Error> {
-    let mut conn = pool.acquire().await?.detach();
-    let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
-        .bind(SCHEDULER_LOCK_ID)
-        .fetch_one(&mut conn)
-        .await?;
+/// Acquire the singleton scheduler lock: an exclusive flock() on a lock file
+/// beside the SQLite database. Returned guard auto-releases on drop (process
+/// exit also releases it — flocks don't survive the holder). A second
+/// instance fails fast with the same visible error as before the port.
+pub async fn acquire_advisory_lock(_pool: &DbPool) -> Result<AdvisoryLockGuard, anyhow::Error> {
+    use fs4::fs_std::FileExt;
+
+    let db_url = crate::db::resolve_database_url();
+    let db_path = std::path::PathBuf::from(
+        db_url
+            .trim_start_matches("sqlite://")
+            .trim_start_matches("sqlite:"),
+    );
+    let lock_path = match db_path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.join(SCHEDULER_LOCK_FILE),
+        _ => std::path::PathBuf::from(SCHEDULER_LOCK_FILE),
+    };
+    if let Some(dir) = lock_path.parent() {
+        std::fs::create_dir_all(dir).ok();
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)?;
+    let acquired = file.try_lock_exclusive()?;
     if !acquired {
         anyhow::bail!(
-            "another ygg scheduler is already running on this database (advisory lock {SCHEDULER_LOCK_ID:#x} held)"
+            "another ygg scheduler is already running on this database (lock file {} held)",
+            lock_path.display()
         );
     }
-    Ok(AdvisoryLockGuard { _conn: conn })
+    Ok(AdvisoryLockGuard { _file: file })
 }
 
 pub struct AdvisoryLockGuard {
-    _conn: sqlx::PgConnection,
+    _file: std::fs::File,
 }
 
 #[cfg(test)]

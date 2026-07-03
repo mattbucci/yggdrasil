@@ -37,7 +37,7 @@ const CTX_LIMIT: i64 = 1_000_000;
 /// shut down *and* was touched within this window — drops stale idle rows.
 const ACTIVE_WINDOW_MINS: i64 = 15;
 
-pub async fn execute(pool: &sqlx::PgPool) -> Result<(), anyhow::Error> {
+pub async fn execute(pool: &crate::db::DbPool) -> Result<(), anyhow::Error> {
     // Read Claude Code's JSON payload from stdin. Non-fatal if absent.
     let mut input = String::new();
     let _ = std::io::stdin().read_to_string(&mut input);
@@ -83,13 +83,13 @@ pub async fn execute(pool: &sqlx::PgPool) -> Result<(), anyhow::Error> {
 /// This agent's Yggdrasil state: `ygg:<name> <state> · N locks · M agents`.
 /// Returns None when the current session has no matching agent row, so the
 /// token line renders alone rather than erroring.
-async fn ygg_segment(pool: &sqlx::PgPool, j: &serde_json::Value) -> Option<String> {
+async fn ygg_segment(pool: &crate::db::DbPool, j: &serde_json::Value) -> Option<String> {
     let name = current_agent_name(j);
     let repo = AgentRepo::new(pool, crate::db::user_id());
     let agent = repo.get_by_name(&name).await.ok()??;
 
     let locks = LockManager::new(pool, 0, crate::db::user_id())
-        .list_agent_locks(agent.agent_id)
+        .list_agent_locks(&agent.agent_id)
         .await
         .map(|v| v.len())
         .unwrap_or(0);

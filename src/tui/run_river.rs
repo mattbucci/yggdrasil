@@ -7,7 +7,7 @@
 //! day's tokens go?" answers itself at a glance.
 //!
 //! Substrate first: this module ships the half-cosine-band folding
-//! math + the glyph picker. The Postgres query (rolling per-minute
+//! math + the glyph picker. The SQL query (rolling per-minute
 //! token rate per agent) and the pane render layer compose on top.
 
 /// One sample (per minute) of an agent's token rate.

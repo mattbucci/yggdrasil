@@ -8,9 +8,8 @@ use crate::cli::task_cmd::resolve_cwd_repo;
 use crate::models::agent::AgentRepo;
 use std::path::Path;
 use std::process::Command;
-use uuid::Uuid;
 
-pub async fn execute(pool: &sqlx::PgPool, agent_name: &str) -> Result<(), anyhow::Error> {
+pub async fn execute(pool: &crate::db::DbPool, agent_name: &str) -> Result<(), anyhow::Error> {
     // Hard kill-switch for users who don't want the check.
     if std::env::var("YGG_STOP_CHECK")
         .map(|v| v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
@@ -29,7 +28,7 @@ pub async fn execute(pool: &sqlx::PgPool, agent_name: &str) -> Result<(), anyhow
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
 
-    let worker: Option<(Uuid, Uuid)> = sqlx::query_as(
+    let worker: Option<(String, String)> = sqlx::query_as(
         r#"SELECT worker_id, task_id
              FROM workers
             WHERE worktree_path = $1 AND ended_at IS NULL
@@ -49,27 +48,26 @@ pub async fn execute(pool: &sqlx::PgPool, agent_name: &str) -> Result<(), anyhow
     let mut reasons: Vec<String> = Vec::new();
 
     // Any tasks this agent still holds in_progress in the current repo.
-    if let Ok(repo) = resolve_cwd_repo(pool).await {
-        if let Ok(Some(agent)) = AgentRepo::new(pool, crate::db::user_id())
+    if let Ok(repo) = resolve_cwd_repo(pool).await
+        && let Ok(Some(agent)) = AgentRepo::new(pool, crate::db::user_id())
             .get_by_name(agent_name)
             .await
-        {
-            let open: Vec<(i32, String)> = sqlx::query_as(
-                r#"SELECT seq, title FROM tasks
+    {
+        let open: Vec<(i32, String)> = sqlx::query_as(
+            r#"SELECT seq, title FROM tasks
                     WHERE repo_id = $1 AND assignee = $2 AND status = 'in_progress'
                     ORDER BY seq"#,
-            )
-            .bind(repo.repo_id)
-            .bind(agent.agent_id)
-            .fetch_all(pool)
-            .await
-            .unwrap_or_default();
-            for (seq, title) in open {
-                reasons.push(format!(
+        )
+        .bind(repo.repo_id)
+        .bind(agent.agent_id)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+        for (seq, title) in open {
+            reasons.push(format!(
                     "task {p}-{seq} still in_progress ({title}) — close with `ygg task close {p}-{seq} --reason \"...\"`",
                     p = repo.task_prefix,
                 ));
-            }
         }
     }
 
@@ -110,12 +108,11 @@ fn check_git_state(cwd: &Path, reasons: &mut Vec<String>) {
         .args(["status", "--porcelain"])
         .current_dir(cwd)
         .output()
+        && out.status.success()
+        && !out.stdout.iter().all(|b| b.is_ascii_whitespace())
     {
-        if out.status.success() && !out.stdout.iter().all(|b| b.is_ascii_whitespace()) {
-            reasons.push(
-                "uncommitted changes in worktree — `git add -A && git commit -m \"...\"`".into(),
-            );
-        }
+        reasons
+            .push("uncommitted changes in worktree — `git add -A && git commit -m \"...\"`".into());
     }
 
     // Unpushed commits. Prefer the upstream comparison; fall back to base.
@@ -123,19 +120,18 @@ fn check_git_state(cwd: &Path, reasons: &mut Vec<String>) {
         .args(["rev-list", "--count", "@{u}..HEAD"])
         .current_dir(cwd)
         .output()
+        && out.status.success()
     {
-        if out.status.success() {
-            let n: u64 = String::from_utf8_lossy(&out.stdout)
-                .trim()
-                .parse()
-                .unwrap_or(0);
-            if n > 0 {
-                reasons.push(format!(
-                    "{n} unpushed commit(s) on current branch — `git push`"
-                ));
-            }
-            return;
+        let n: u64 = String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .unwrap_or(0);
+        if n > 0 {
+            reasons.push(format!(
+                "{n} unpushed commit(s) on current branch — `git push`"
+            ));
         }
+        return;
     }
 
     // No upstream set. Compare against likely base branches; if the branch
@@ -145,19 +141,18 @@ fn check_git_state(cwd: &Path, reasons: &mut Vec<String>) {
             .args(["rev-list", "--count", &format!("{base}..HEAD")])
             .current_dir(cwd)
             .output()
+            && out.status.success()
         {
-            if out.status.success() {
-                let n: u64 = String::from_utf8_lossy(&out.stdout)
-                    .trim()
-                    .parse()
-                    .unwrap_or(0);
-                if n > 0 {
-                    reasons.push(format!(
-                        "{n} commit(s) on unpublished branch — `git push -u origin HEAD`"
-                    ));
-                }
-                return;
+            let n: u64 = String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .parse()
+                .unwrap_or(0);
+            if n > 0 {
+                reasons.push(format!(
+                    "{n} commit(s) on unpublished branch — `git push -u origin HEAD`"
+                ));
             }
+            return;
         }
     }
 }

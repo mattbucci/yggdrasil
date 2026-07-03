@@ -11,24 +11,23 @@
 //!         hook calls this after injecting.
 
 use crate::config::AppConfig;
+use crate::db::DbPool;
 use crate::models::agent::AgentRepo;
 use crate::tmux::TmuxManager;
 use chrono::{DateTime, Utc};
-use sqlx::PgPool;
 use std::process::Command;
-use uuid::Uuid;
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Message {
-    pub id: Uuid,
-    pub from_agent_id: Option<Uuid>,
+    pub id: String,
+    pub from_agent_id: Option<String>,
     pub from_agent_name: String,
     pub body: String,
     pub created_at: DateTime<Utc>,
 }
 
 pub async fn send(
-    pool: &PgPool,
+    pool: &DbPool,
     from_agent_name: &str,
     to_agent_name: &str,
     body: &str,
@@ -38,7 +37,7 @@ pub async fn send(
 }
 
 pub async fn send_inner(
-    pool: &PgPool,
+    pool: &DbPool,
     from_agent_name: &str,
     to_agent_name: &str,
     body: &str,
@@ -51,10 +50,10 @@ pub async fn send_inner(
 
     // Record the message event regardless of spawn outcome.
     let (to_id, recipient_exists) = match &to {
-        Some(a) => (Some(a.agent_id), true),
+        Some(a) => (Some(a.agent_id.clone()), true),
         None => (None, false),
     };
-    let from_id = from.as_ref().map(|a| a.agent_id);
+    let from_id = from.as_ref().map(|a| a.agent_id.clone());
     let payload = serde_json::json!({ "body": body });
 
     if let Some(tid) = to_id {
@@ -62,7 +61,7 @@ pub async fn send_inner(
             "INSERT INTO events (event_kind, agent_id, agent_name, recipient_agent_id, payload)
              VALUES ('message', $1, $2, $3, $4)",
         )
-        .bind(from_id)
+        .bind(&from_id)
         .bind(from_agent_name)
         .bind(tid)
         .bind(&payload)
@@ -71,9 +70,15 @@ pub async fn send_inner(
     }
 
     // Detect whether the recipient has a live tmux window. Propagate tmux
-    // errors so transient failures don't trigger a spurious spawn.
+    // errors so transient failures don't trigger a spurious spawn — except
+    // under --no-spawn, where a missing/broken tmux simply means "inactive"
+    // (the message row is already recorded above).
     let has_window = if recipient_exists {
-        TmuxManager::has_agent_window(to_agent_name).await?
+        match TmuxManager::has_agent_window(to_agent_name).await {
+            Ok(v) => v,
+            Err(_) if no_spawn => false,
+            Err(e) => return Err(e.into()),
+        }
     } else {
         false
     };
@@ -98,19 +103,17 @@ pub async fn send_inner(
 
         // Record the message event even if spawn partially failed (the agent
         // row may already exist from spawn::execute's register call).
-        if !recipient_exists {
-            if let Some(new_agent) = repo.get_by_name(to_agent_name).await? {
-                sqlx::query(
-                    "INSERT INTO events (event_kind, agent_id, agent_name, recipient_agent_id, payload)
+        if !recipient_exists && let Some(new_agent) = repo.get_by_name(to_agent_name).await? {
+            sqlx::query(
+                "INSERT INTO events (event_kind, agent_id, agent_name, recipient_agent_id, payload)
                      VALUES ('message', $1, $2, $3, $4)",
-                )
-                .bind(from_id)
-                .bind(from_agent_name)
-                .bind(new_agent.agent_id)
-                .bind(&payload)
-                .execute(pool)
-                .await?;
-            }
+            )
+            .bind(from_id)
+            .bind(from_agent_name)
+            .bind(new_agent.agent_id)
+            .bind(&payload)
+            .execute(pool)
+            .await?;
         }
         spawn_result?;
     }
@@ -123,7 +126,7 @@ pub async fn send_inner(
 /// successful injection. Pass `all=true` to see every message regardless
 /// of cursor position.
 pub async fn inbox(
-    pool: &PgPool,
+    pool: &DbPool,
     agent_name: &str,
     all: bool,
 ) -> Result<Vec<Message>, anyhow::Error> {
@@ -139,52 +142,60 @@ pub async fn inbox(
         None
     } else {
         sqlx::query_scalar("SELECT message_cursor FROM agents WHERE agent_id = $1")
-            .bind(agent.agent_id)
+            .bind(&agent.agent_id)
             .fetch_optional(pool)
             .await?
             .flatten()
     };
 
-    let rows: Vec<Message> =
-        sqlx::query_as::<_, (Uuid, Option<Uuid>, String, serde_json::Value, DateTime<Utc>)>(
-            r#"SELECT id, agent_id, agent_name, payload, created_at
+    let rows: Vec<Message> = sqlx::query_as::<
+        _,
+        (
+            String,
+            Option<String>,
+            String,
+            serde_json::Value,
+            DateTime<Utc>,
+        ),
+    >(
+        r#"SELECT id, agent_id, agent_name, payload, created_at
              FROM events
             WHERE event_kind = 'message'
               AND recipient_agent_id = $1
-              AND ($2::timestamptz IS NULL OR created_at > $2)
-            ORDER BY created_at ASC
+              AND ($2 IS NULL OR created_at > $2)
+            ORDER BY created_at ASC, rowid ASC
             LIMIT 200"#,
-        )
-        .bind(agent.agent_id)
-        .bind(cursor)
-        .fetch_all(pool)
-        .await?
-        .into_iter()
-        .map(|(id, aid, aname, payload, ts)| Message {
-            id,
-            from_agent_id: aid,
-            from_agent_name: aname,
-            body: payload
-                .get("body")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            created_at: ts,
-        })
-        .collect();
+    )
+    .bind(&agent.agent_id)
+    .bind(cursor)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|(id, aid, aname, payload, ts)| Message {
+        id,
+        from_agent_id: aid,
+        from_agent_name: aname,
+        body: payload
+            .get("body")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        created_at: ts,
+    })
+    .collect();
 
     Ok(rows)
 }
 
 /// Advance the cursor to `now`. Called by the hook after the block has
 /// been injected so the same messages don't resurface next turn.
-pub async fn mark_read(pool: &PgPool, agent_name: &str) -> Result<(), anyhow::Error> {
+pub async fn mark_read(pool: &DbPool, agent_name: &str) -> Result<(), anyhow::Error> {
     let repo = AgentRepo::new(pool, crate::db::user_id());
     let agent = repo
         .get_by_name(agent_name)
         .await?
         .ok_or_else(|| anyhow::anyhow!("agent '{agent_name}' not found"))?;
-    sqlx::query("UPDATE agents SET message_cursor = now() WHERE agent_id = $1")
+    sqlx::query("UPDATE agents SET message_cursor = strftime('%Y-%m-%dT%H:%M:%f+00:00','now') WHERE agent_id = $1")
         .bind(agent.agent_id)
         .execute(pool)
         .await?;
@@ -211,16 +222,16 @@ pub fn print_inbox(msgs: &[Message]) {
 
 /// Send a broadcast message (no specific recipient). Any agent can claim it.
 pub async fn broadcast(
-    pool: &PgPool,
+    pool: &DbPool,
     from_agent_name: &str,
     body: &str,
-) -> Result<Uuid, anyhow::Error> {
+) -> Result<String, anyhow::Error> {
     let repo = AgentRepo::new(pool, crate::db::user_id());
     let from = repo.get_by_name(from_agent_name).await?;
-    let from_id = from.as_ref().map(|a| a.agent_id);
+    let from_id = from.as_ref().map(|a| a.agent_id.clone());
     let payload = serde_json::json!({ "body": body });
 
-    let id: Uuid = sqlx::query_scalar(
+    let id: String = sqlx::query_scalar(
         "INSERT INTO events (event_kind, agent_id, agent_name, recipient_agent_id, payload)
          VALUES ('message', $1, $2, NULL, $3)
          RETURNING id",
@@ -237,8 +248,8 @@ pub async fn broadcast(
 
 /// Claim an unclaimed broadcast message for a specific agent.
 pub async fn claim_broadcast(
-    pool: &PgPool,
-    event_id: Uuid,
+    pool: &DbPool,
+    event_id: String,
     agent_name: &str,
 ) -> Result<(), anyhow::Error> {
     let repo = AgentRepo::new(pool, crate::db::user_id());
@@ -254,7 +265,7 @@ pub async fn claim_broadcast(
             AND recipient_agent_id IS NULL",
     )
     .bind(agent.agent_id)
-    .bind(event_id)
+    .bind(&event_id)
     .execute(pool)
     .await?
     .rows_affected();
@@ -268,13 +279,13 @@ pub async fn claim_broadcast(
 
 /// Fetch all recent messages (directed + broadcast) for the TUI chat panel.
 pub async fn all_messages(
-    pool: &PgPool,
+    pool: &DbPool,
     hours: i64,
     limit: i64,
 ) -> Result<Vec<ChatMessage>, anyhow::Error> {
     let rows: Vec<(
-        Uuid,
-        Option<Uuid>,
+        String,
+        Option<String>,
         String,
         Option<String>,
         serde_json::Value,
@@ -286,7 +297,7 @@ pub async fn all_messages(
                  FROM events e
                  LEFT JOIN agents a ON a.agent_id = e.recipient_agent_id
                 WHERE e.event_kind = 'message'
-                  AND e.created_at > now() - interval '1 hour' * $1
+                  AND e.created_at > strftime('%Y-%m-%dT%H:%M:%f+00:00','now','-' || ($1 * 60) || ' minutes')
                 ORDER BY e.created_at DESC
                 LIMIT $2"#,
     )
@@ -315,7 +326,7 @@ pub async fn all_messages(
 
 #[derive(Debug, Clone)]
 pub struct ChatMessage {
-    pub id: Uuid,
+    pub id: String,
     pub from_name: String,
     pub to_name: Option<String>,
     pub body: String,

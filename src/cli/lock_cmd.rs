@@ -4,7 +4,7 @@ use crate::models::agent::AgentRepo;
 
 /// Handle `ygg lock acquire <resource>`
 pub async fn acquire(
-    pool: &sqlx::PgPool,
+    pool: &crate::db::DbPool,
     config: &AppConfig,
     resource: &str,
     agent_name: &str,
@@ -16,7 +16,7 @@ pub async fn acquire(
         .ok_or_else(|| anyhow::anyhow!("agent '{}' not found", agent_name))?;
 
     let lock_mgr = LockManager::new(pool, config.lock_ttl_secs, crate::db::user_id());
-    match lock_mgr.acquire(resource, agent.agent_id).await {
+    match lock_mgr.acquire(resource, &agent.agent_id).await {
         Ok(lock) => {
             println!(
                 "Lock acquired: {} (expires {})",
@@ -32,7 +32,7 @@ pub async fn acquire(
 
 /// Handle `ygg lock release <resource>`
 pub async fn release(
-    pool: &sqlx::PgPool,
+    pool: &crate::db::DbPool,
     config: &AppConfig,
     resource: &str,
     agent_name: &str,
@@ -44,14 +44,14 @@ pub async fn release(
         .ok_or_else(|| anyhow::anyhow!("agent '{}' not found", agent_name))?;
 
     let lock_mgr = LockManager::new(pool, config.lock_ttl_secs, crate::db::user_id());
-    lock_mgr.release(resource, agent.agent_id).await?;
+    lock_mgr.release(resource, &agent.agent_id).await?;
     println!("Lock released: {resource}");
     Ok(())
 }
 
 /// Handle `ygg lock list` (and `--stale`)
 pub async fn list(
-    pool: &sqlx::PgPool,
+    pool: &crate::db::DbPool,
     config: &AppConfig,
     stale_only: bool,
     stale_secs: i64,
@@ -83,7 +83,7 @@ pub async fn list(
     );
     for lock in &locks {
         let agent = agent_repo
-            .get(lock.agent_id)
+            .get(&lock.agent_id)
             .await
             .ok()
             .flatten()

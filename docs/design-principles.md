@@ -11,7 +11,7 @@ Inference is the expensive substrate; shell, compiled binaries, file I/O, and em
 Yggdrasil already operates this way:
 
 - Similarity search is compiled Rust against `pgvector`, not a model call.
-- The lock check is a Postgres `UNIQUE` constraint, not an agent decision.
+- The lock check is a database `UNIQUE` constraint, not an agent decision.
 - The digest extractor is a shell-plus-Rust pipeline that hands the agent a finished summary.
 - Embedding is Ollama HTTP, not a frontier API call during a tool loop.
 

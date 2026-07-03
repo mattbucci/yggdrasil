@@ -1,14 +1,13 @@
+use crate::db::DbPool;
 use chrono::Utc;
-use sqlx::PgPool;
-use uuid::Uuid;
 
 use super::classifier::TaskCategory;
 use super::collector::TokenUsage;
 
 /// Write aggregated stats to the agent_stats table.
 pub async fn record_stats(
-    pool: &PgPool,
-    agent_id: Uuid,
+    pool: &DbPool,
+    agent_id: &str,
     usage: &TokenUsage,
     category: &TaskCategory,
 ) -> Result<(), sqlx::Error> {
@@ -16,7 +15,7 @@ pub async fn record_stats(
     let now = Utc::now();
     let period = now
         .date_naive()
-        .and_hms_opt(now.time().hour() as u32, 0, 0)
+        .and_hms_opt(now.time().hour(), 0, 0)
         .unwrap()
         .and_utc();
 
@@ -54,15 +53,15 @@ pub async fn record_stats(
 /// with the running aggregate instead of adding to it. Safe to call on every
 /// PromptSubmit turn without double-counting.
 pub async fn replace_stats(
-    pool: &PgPool,
-    agent_id: Uuid,
+    pool: &DbPool,
+    agent_id: &str,
     usage: &TokenUsage,
     category: &TaskCategory,
 ) -> Result<(), sqlx::Error> {
     let now = Utc::now();
     let period = now
         .date_naive()
-        .and_hms_opt(now.time().hour() as u32, 0, 0)
+        .and_hms_opt(now.time().hour(), 0, 0)
         .unwrap()
         .and_utc();
 
@@ -107,7 +106,7 @@ fn estimate_cost(usage: &TokenUsage) -> f64 {
 }
 
 /// Query total stats for an agent.
-pub async fn get_agent_totals(pool: &PgPool, agent_id: Uuid) -> Result<AgentTotals, sqlx::Error> {
+pub async fn get_agent_totals(pool: &DbPool, agent_id: &str) -> Result<AgentTotals, sqlx::Error> {
     let row = sqlx::query_as::<_, AgentTotals>(
         r#"
         SELECT COALESCE(SUM(input_tokens), 0) AS input_tokens,
@@ -115,7 +114,7 @@ pub async fn get_agent_totals(pool: &PgPool, agent_id: Uuid) -> Result<AgentTota
                COALESCE(SUM(cache_read), 0) AS cache_read,
                COALESCE(SUM(cache_write), 0) AS cache_write,
                COALESCE(SUM(tool_calls), 0) AS tool_calls,
-               COALESCE(SUM(estimated_cost), 0) AS estimated_cost
+               COALESCE(SUM(estimated_cost), 0.0) AS estimated_cost
         FROM agent_stats WHERE agent_id = $1
         "#,
     )
@@ -133,7 +132,7 @@ pub struct AgentTotals {
     pub cache_read: i64,
     pub cache_write: i64,
     pub tool_calls: i32,
-    pub estimated_cost: sqlx::types::BigDecimal,
+    pub estimated_cost: f64,
 }
 
 use chrono::Timelike;

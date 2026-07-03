@@ -6,7 +6,6 @@ use crate::bench::manifest::{LoadedManifest, TaskSpec};
 use crate::bench::{Baseline, BenchRepo, BenchTaskResult};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
-use uuid::Uuid;
 
 /// Per-task outcome captured by the driver. Tokens are optional (Claude
 /// usage block may not be available; the driver returns None).
@@ -17,7 +16,7 @@ pub struct DriverOutcome {
     pub tokens_in: Option<i64>,
     pub tokens_out: Option<i64>,
     pub tokens_cache: Option<i64>,
-    pub usd: Option<sqlx::types::BigDecimal>,
+    pub usd: Option<f64>,
     pub commit_sha: Option<String>,
     pub stderr_tail: Option<String>,
 }
@@ -64,12 +63,12 @@ impl Default for RunnerConfig {
 }
 
 pub async fn execute(
-    pool: &sqlx::PgPool,
+    pool: &crate::db::DbPool,
     manifest: &LoadedManifest,
     driver: &dyn Driver,
     seed: Option<i64>,
     cfg: &RunnerConfig,
-) -> Result<Uuid, anyhow::Error> {
+) -> Result<String, anyhow::Error> {
     let model =
         std::env::var("YGG_BENCH_MODEL").unwrap_or_else(|_| "claude-sonnet-4-6".to_string());
 
@@ -105,8 +104,12 @@ pub async fn execute(
     let outcomes = match driver_result {
         Ok(v) => v,
         Err(e) => {
-            repo.finalize(bench_run.run_id, false, Some(&format!("driver error: {e}")))
-                .await?;
+            repo.finalize(
+                &bench_run.run_id,
+                false,
+                Some(&format!("driver error: {e}")),
+            )
+            .await?;
             return Err(e);
         }
     };
@@ -114,32 +117,32 @@ pub async fn execute(
     let mut all_passed = !outcomes.is_empty();
     for (idx, out) in outcomes.iter().enumerate() {
         let result = BenchTaskResult {
-            run_id: bench_run.run_id,
+            run_id: bench_run.run_id.clone(),
             task_idx: idx as i32,
             passed: out.passed,
             wall_clock_s: out.wall_clock_s as i32,
             tokens_in: out.tokens_in,
             tokens_out: out.tokens_out,
             tokens_cache: out.tokens_cache,
-            usd: out.usd.clone(),
+            usd: out.usd,
             reopened: false,
         };
-        repo.write_task_result(bench_run.run_id, &result).await?;
+        repo.write_task_result(&bench_run.run_id, &result).await?;
         all_passed &= out.passed;
     }
     repo.write_metric(
-        bench_run.run_id,
+        &bench_run.run_id,
         "wall_clock_total_s",
         wall_clock_total_s as f64,
     )
     .await?;
     repo.write_metric(
-        bench_run.run_id,
+        &bench_run.run_id,
         "tasks_passed",
         outcomes.iter().filter(|o| o.passed).count() as f64,
     )
     .await?;
-    repo.finalize(bench_run.run_id, all_passed, None).await?;
+    repo.finalize(&bench_run.run_id, all_passed, None).await?;
 
     // Run the deterministic grader on the final workspace state.
     let grader_passed = run_grader(manifest, &workspace).is_ok();
@@ -147,7 +150,7 @@ pub async fn execute(
         // The driver said pass but the structural grader disagrees. Mark
         // the run failed and append a note so the user sees the disconnect.
         repo.finalize(
-            bench_run.run_id,
+            &bench_run.run_id,
             false,
             Some("driver reported pass but grade.sh failed"),
         )

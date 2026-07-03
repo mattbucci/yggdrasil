@@ -1,11 +1,10 @@
+use crate::db::DbPool;
 use chrono::{Duration as CDuration, Utc};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Sparkline, Table};
-use sqlx::PgPool;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
-use uuid::Uuid;
 
 use crate::lock::LockManager;
 use crate::models::agent::{AgentRepo, AgentWorkflow};
@@ -22,7 +21,7 @@ pub struct DashboardView {
     agents: Vec<AgentWorkflow>,
     locks: Vec<crate::lock::ResourceLock>,
     selected: usize,
-    agent_name_by_id: HashMap<Uuid, String>,
+    agent_name_by_id: HashMap<String, String>,
 
     // Pulse numbers
     prompts_1h: i64,
@@ -31,8 +30,8 @@ pub struct DashboardView {
     cache_total_24h: i64,
     redactions_24h: i64,
     prompts_hourly: Vec<u64>, // global, last 24h, oldest→newest
-    per_agent_hourly: HashMap<Uuid, [u64; 24]>, // per agent, last 24h
-    per_agent_tokens: HashMap<Uuid, (i64, i64)>, // (input, output) from agent_stats
+    per_agent_hourly: HashMap<String, [u64; 24]>, // per agent, last 24h
+    per_agent_tokens: HashMap<String, (i64, i64)>, // (input, output) from agent_stats
     recent_transitions: Vec<(
         chrono::DateTime<chrono::Utc>,
         String,
@@ -60,7 +59,7 @@ pub struct DashboardView {
     /// The session id the pulse is currently scoped to, populated on refresh.
     pub current_session_id: Option<String>,
     /// Live session count per agent, refreshed with the rest of the state.
-    pub live_sessions_by_agent: HashMap<Uuid, i64>,
+    pub live_sessions_by_agent: HashMap<String, i64>,
 
     /// Corpus totals for the system-pulse DB line. Refreshed every tick —
     /// cheap COUNTs on indexed tables.
@@ -72,7 +71,7 @@ pub struct DashboardView {
     /// Inline rename buffer on the agents panel. When `Some`, typed keys
     /// append to the buffer; Enter commits; Esc cancels. Tuple:
     /// `(agent_id_being_renamed, buffer)`.
-    pub rename: Option<(Uuid, String)>,
+    pub rename: Option<(String, String)>,
     /// Message input buffer. When `Some`, typed keys append to the body;
     /// Enter sends via msg_cmd::send; Esc cancels. (recipient, body).
     pub msg: Option<(String, String)>,
@@ -182,6 +181,12 @@ struct RunSnap {
     ended_at: chrono::DateTime<chrono::Utc>,
 }
 
+impl Default for DashboardView {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DashboardView {
     pub fn new() -> Self {
         Self {
@@ -234,7 +239,7 @@ impl DashboardView {
     /// is visible in the panel title.
     ///
     /// Disabled by setting `YGG_AUTO_ARCHIVE_ORPHANS=0`.
-    async fn sweep_orphans(&mut self, pool: &PgPool) {
+    async fn sweep_orphans(&mut self, pool: &DbPool) {
         let enabled = std::env::var("YGG_AUTO_ARCHIVE_ORPHANS")
             .map(|v| {
                 !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
@@ -249,10 +254,10 @@ impl DashboardView {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(300);
         let now = Instant::now();
-        if let Some(last) = self.orphan_last_check {
-            if now.duration_since(last).as_secs() < interval {
-                return;
-            }
+        if let Some(last) = self.orphan_last_check
+            && now.duration_since(last).as_secs() < interval
+        {
+            return;
         }
         self.orphan_last_check = Some(now);
 
@@ -271,10 +276,10 @@ impl DashboardView {
         let repo = AgentRepo::new(pool, crate::db::user_id());
         let mut archived: Vec<String> = Vec::new();
         for (agent_id, agent_name, worktree_path) in candidates {
-            if !std::path::Path::new(&worktree_path).exists() {
-                if repo.archive(agent_id).await.is_ok() {
-                    archived.push(agent_name);
-                }
+            if !std::path::Path::new(&worktree_path).exists()
+                && repo.archive(&agent_id).await.is_ok()
+            {
+                archived.push(agent_name);
             }
         }
         if !archived.is_empty() {
@@ -292,7 +297,7 @@ impl DashboardView {
     }
     pub fn rename_begin(&mut self) {
         if let Some(a) = self.agents.get(self.selected) {
-            self.rename = Some((a.agent_id, a.agent_name.clone()));
+            self.rename = Some((a.agent_id.clone(), a.agent_name.clone()));
             self.flash = None;
         }
     }
@@ -315,7 +320,7 @@ impl DashboardView {
 
     /// Commit the in-flight rename. On success, refreshes the agents list so
     /// the new name is visible immediately. Sets `flash` regardless of outcome.
-    pub async fn rename_commit(&mut self, pool: &PgPool) {
+    pub async fn rename_commit(&mut self, pool: &DbPool) {
         let Some((agent_id, buf)) = self.rename.take() else {
             return;
         };
@@ -325,16 +330,16 @@ impl DashboardView {
             return;
         }
         let repo = AgentRepo::new(pool, crate::db::user_id());
-        match repo.rename(agent_id, new_name).await {
+        match repo.rename(&agent_id, new_name).await {
             Ok(()) => {
                 self.flash = Some(format!("renamed → {new_name}"));
                 let _ = self.refresh(pool).await;
             }
             Err(e) => {
-                let code = e
+                let is_unique = e
                     .as_database_error()
-                    .and_then(|d| d.code().map(|c| c.to_string()));
-                self.flash = Some(if code.as_deref() == Some("23505") {
+                    .is_some_and(|d| d.is_unique_violation());
+                self.flash = Some(if is_unique {
                     format!("rename failed: '{new_name}' already exists")
                 } else {
                     format!("rename failed: {e}")
@@ -365,7 +370,7 @@ impl DashboardView {
             buf.pop();
         }
     }
-    pub async fn msg_commit(&mut self, pool: &PgPool, from_agent: &str) {
+    pub async fn msg_commit(&mut self, pool: &DbPool, from_agent: &str) {
         let Some((to, body)) = self.msg.take() else {
             return;
         };
@@ -386,12 +391,12 @@ impl DashboardView {
 
     /// Archive the currently-selected agent. Fires on `a` when no rename is
     /// in flight; refreshes the list so the archived row disappears.
-    pub async fn archive_selected(&mut self, pool: &PgPool) {
+    pub async fn archive_selected(&mut self, pool: &DbPool) {
         let Some(a) = self.agents.get(self.selected).cloned() else {
             return;
         };
         let repo = AgentRepo::new(pool, crate::db::user_id());
-        match repo.archive(a.agent_id).await {
+        match repo.archive(&a.agent_id).await {
             Ok(()) => {
                 self.flash = Some(format!("archived '{}'", a.agent_name));
                 let _ = self.refresh(pool).await;
@@ -418,17 +423,17 @@ impl DashboardView {
 
     fn cached_pressure(&mut self, agent_name: &str) -> Option<(i64, i64)> {
         let now = Instant::now();
-        if let Some((t, v)) = self.pressure_cache.get(agent_name) {
-            if now.duration_since(*t) < PRESSURE_TTL {
-                return *v;
-            }
+        if let Some((t, v)) = self.pressure_cache.get(agent_name)
+            && now.duration_since(*t) < PRESSURE_TTL
+        {
+            return *v;
         }
         let v = agent_context_usage(agent_name);
         self.pressure_cache.insert(agent_name.to_string(), (now, v));
         v
     }
 
-    pub async fn refresh(&mut self, pool: &PgPool) -> Result<(), anyhow::Error> {
+    pub async fn refresh(&mut self, pool: &DbPool) -> Result<(), anyhow::Error> {
         // Throttled orphan sweep — runs before the list query so any just-
         // archived agents disappear on this same tick.
         self.sweep_orphans(pool).await;
@@ -437,7 +442,7 @@ impl DashboardView {
         // index, but we sort by updated_at below — without this, the
         // user's cursor would drift to whichever row landed at that
         // index on this tick.
-        let pinned_id = self.agents.get(self.selected).map(|a| a.agent_id);
+        let pinned_id = self.agents.get(self.selected).map(|a| a.agent_id.clone());
 
         let agent_repo = AgentRepo::new(pool, crate::db::user_id());
         let mut agents = if self.filter_my_agents {
@@ -453,7 +458,7 @@ impl DashboardView {
         self.agent_name_by_id = self
             .agents
             .iter()
-            .map(|a| (a.agent_id, a.agent_name.clone()))
+            .map(|a| (a.agent_id.clone(), a.agent_name.clone()))
             .collect();
 
         // Restore selection to the same agent_id it pointed to before
@@ -485,7 +490,7 @@ impl DashboardView {
             sqlx::query_scalar::<_, Option<String>>(
                 "SELECT cc_session_id FROM events
                  WHERE cc_session_id IS NOT NULL
-                   AND created_at > now() - interval '6 hours'
+                   AND created_at > strftime('%Y-%m-%dT%H:%M:%f+00:00','now','-6 hours')
                  ORDER BY created_at DESC LIMIT 1",
             )
             .fetch_optional(pool)
@@ -512,8 +517,8 @@ impl DashboardView {
         let (p1h, d1h): (i64, i64) = if let Some(sid) = sid.as_deref() {
             sqlx::query_as(
                 r#"SELECT
-                     COUNT(*) FILTER (WHERE event_kind::text = 'hook_fired' AND payload->>'hook' = 'UserPromptSubmit'),
-                     COUNT(*) FILTER (WHERE event_kind::text = 'digest_written')
+                     COUNT(*) FILTER (WHERE event_kind = 'hook_fired' AND payload->>'hook' = 'UserPromptSubmit'),
+                     COUNT(*) FILTER (WHERE event_kind = 'digest_written')
                    FROM events WHERE cc_session_id = $1"#,
             )
             .bind(sid)
@@ -523,8 +528,8 @@ impl DashboardView {
         } else {
             sqlx::query_as(
                 r#"SELECT
-                     COUNT(*) FILTER (WHERE event_kind::text = 'hook_fired' AND payload->>'hook' = 'UserPromptSubmit'),
-                     COUNT(*) FILTER (WHERE event_kind::text = 'digest_written')
+                     COUNT(*) FILTER (WHERE event_kind = 'hook_fired' AND payload->>'hook' = 'UserPromptSubmit'),
+                     COUNT(*) FILTER (WHERE event_kind = 'digest_written')
                    FROM events WHERE created_at >= $1"#,
             )
             .bind(since_1h)
@@ -538,9 +543,9 @@ impl DashboardView {
         let (ch24, cc24, r24): (i64, i64, i64) = if let Some(sid) = sid.as_deref() {
             sqlx::query_as(
                 r#"SELECT
-                     COUNT(*) FILTER (WHERE event_kind::text = 'embedding_cache_hit'),
-                     COUNT(*) FILTER (WHERE event_kind::text = 'embedding_call'),
-                     COUNT(*) FILTER (WHERE event_kind::text = 'redaction_applied')
+                     COUNT(*) FILTER (WHERE event_kind = 'embedding_cache_hit'),
+                     COUNT(*) FILTER (WHERE event_kind = 'embedding_call'),
+                     COUNT(*) FILTER (WHERE event_kind = 'redaction_applied')
                    FROM events WHERE cc_session_id = $1"#,
             )
             .bind(sid)
@@ -550,9 +555,9 @@ impl DashboardView {
         } else {
             sqlx::query_as(
                 r#"SELECT
-                     COUNT(*) FILTER (WHERE event_kind::text = 'embedding_cache_hit'),
-                     COUNT(*) FILTER (WHERE event_kind::text = 'embedding_call'),
-                     COUNT(*) FILTER (WHERE event_kind::text = 'redaction_applied')
+                     COUNT(*) FILTER (WHERE event_kind = 'embedding_cache_hit'),
+                     COUNT(*) FILTER (WHERE event_kind = 'embedding_call'),
+                     COUNT(*) FILTER (WHERE event_kind = 'redaction_applied')
                    FROM events WHERE created_at >= $1"#,
             )
             .bind(since_24h)
@@ -574,7 +579,7 @@ impl DashboardView {
                  (SELECT COUNT(*) FROM tasks WHERE status <> 'closed'),
                  (SELECT COUNT(*) FROM tasks),
                  (SELECT COUNT(*) FROM learnings),
-                 (SELECT COUNT(*) FROM locks WHERE expires_at > now())"#,
+                 (SELECT COUNT(*) FROM locks WHERE expires_at > strftime('%Y-%m-%dT%H:%M:%f+00:00','now'))"#,
             )
             .fetch_one(pool)
             .await
@@ -587,11 +592,11 @@ impl DashboardView {
         // Prompts per hour sparkline, 24h — global across agents.
         // Uses hook_fired/UserPromptSubmit which fires on every user turn.
         let sparkline: Vec<(i32, i64)> = sqlx::query_as(
-            "SELECT (24 - FLOOR(EXTRACT(EPOCH FROM (now() - created_at)) / 3600))::int,
+            "SELECT (24 - CAST((julianday('now') - julianday(created_at)) * 24 AS INTEGER)),
                     COUNT(*)
              FROM events
-             WHERE created_at >= now() - interval '24 hours'
-               AND event_kind::text = 'hook_fired'
+             WHERE created_at >= strftime('%Y-%m-%dT%H:%M:%f+00:00','now','-24 hours')
+               AND event_kind = 'hook_fired'
                AND payload->>'hook' = 'UserPromptSubmit'
              GROUP BY 1 ORDER BY 1",
         )
@@ -606,13 +611,13 @@ impl DashboardView {
         self.prompts_hourly = series;
 
         // Per-agent prompts-per-hour sparkline, 24h — one row per (agent, bucket).
-        let per_agent: Vec<(Uuid, i32, i64)> = sqlx::query_as(
+        let per_agent: Vec<(String, i32, i64)> = sqlx::query_as(
             "SELECT agent_id,
-                    (24 - FLOOR(EXTRACT(EPOCH FROM (now() - created_at)) / 3600))::int,
+                    (24 - CAST((julianday('now') - julianday(created_at)) * 24 AS INTEGER)),
                     COUNT(*)
              FROM events
-             WHERE created_at >= now() - interval '24 hours'
-               AND event_kind::text = 'hook_fired'
+             WHERE created_at >= strftime('%Y-%m-%dT%H:%M:%f+00:00','now','-24 hours')
+               AND event_kind = 'hook_fired'
                AND payload->>'hook' = 'UserPromptSubmit'
                AND agent_id IS NOT NULL
              GROUP BY 1, 2",
@@ -628,10 +633,10 @@ impl DashboardView {
         }
 
         // Per-agent cumulative token totals from agent_stats.
-        let agent_tokens: Vec<(Uuid, i64, i64)> = sqlx::query_as(
+        let agent_tokens: Vec<(String, i64, i64)> = sqlx::query_as(
             "SELECT agent_id,
-                    COALESCE(SUM(input_tokens + cache_read + cache_write), 0)::bigint,
-                    COALESCE(SUM(output_tokens), 0)::bigint
+                    COALESCE(SUM(input_tokens + cache_read + cache_write), 0),
+                    COALESCE(SUM(output_tokens), 0)
              FROM agent_stats GROUP BY 1",
         )
         .fetch_all(pool)
@@ -697,7 +702,7 @@ impl DashboardView {
         )> = sqlx::query_as(
             r#"SELECT r.task_prefix, t.seq, t.title,
                           a.agent_name, a.persona,
-                          w.state::text, w.started_at, w.last_seen_at,
+                          w.state, w.started_at, w.last_seen_at,
                           w.tmux_session, w.tmux_window,
                           w.branch_pushed, w.branch_merged, w.pr_url,
                           w.intent
@@ -706,7 +711,7 @@ impl DashboardView {
                      JOIN repos r ON r.repo_id = t.repo_id
                      LEFT JOIN agents a ON a.agent_id = t.assignee
                     WHERE w.ended_at IS NULL
-                       OR (w.ended_at > now() - interval '24 hours'
+                       OR (w.ended_at > strftime('%Y-%m-%dT%H:%M:%f+00:00','now','-24 hours')
                            AND (w.branch_pushed = false OR w.branch_merged = false))
                     ORDER BY (w.ended_at IS NULL) DESC, w.started_at DESC
                     LIMIT 15"#,
@@ -776,8 +781,8 @@ impl DashboardView {
 
         let recent_rows: Vec<(String, String, chrono::DateTime<chrono::Utc>, String)> =
             sqlx::query_as(
-                "SELECT r.state::text, r.reason::text, r.ended_at,
-                    COALESCE(rp.prefix || '-' || t.seq::text, LEFT(t.task_id::text, 8)) AS task_ref
+                "SELECT r.state, r.reason, r.ended_at,
+                    COALESCE(rp.prefix || '-' || t.seq, LEFT(t.task_id, 8)) AS task_ref
                  FROM task_runs r
                  JOIN tasks t ON t.task_id = r.task_id
                  LEFT JOIN repos rp ON rp.repo_id = t.repo_id
@@ -804,8 +809,8 @@ impl DashboardView {
         let interval_sql = self.runs_window.interval_sql();
         let query = format!(
             "SELECT created_at, 1 FROM events \
-             WHERE event_kind::text = 'run_terminal' \
-               AND created_at >= now() - interval '{interval_sql}' \
+             WHERE event_kind = 'run_terminal' \
+               AND created_at >= strftime('%Y-%m-%dT%H:%M:%f+00:00','now','-{interval_sql}') \
              ORDER BY created_at"
         );
         let spark_rows: Vec<(chrono::DateTime<chrono::Utc>, i64)> = sqlx::query_as(&query)
@@ -826,7 +831,7 @@ impl DashboardView {
         let top_loop: Option<i64> = sqlx::query_scalar(
             "SELECT COUNT(*) c FROM task_runs
               WHERE fingerprint IS NOT NULL
-                AND ended_at >= now() - interval '1 hour'
+                AND ended_at >= strftime('%Y-%m-%dT%H:%M:%f+00:00','now','-1 hour')
               GROUP BY fingerprint
               ORDER BY c DESC LIMIT 1",
         )
@@ -1753,7 +1758,7 @@ fn text_sparkline(series: &[u64], max: u64) -> String {
             if v == 0 {
                 ' '
             } else {
-                let step = ((v * 7 + max - 1) / max).min(7) as usize;
+                let step = (v * 7).div_ceil(max).min(7) as usize;
                 BARS[step]
             }
         })

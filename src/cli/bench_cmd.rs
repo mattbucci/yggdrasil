@@ -5,8 +5,7 @@ use crate::bench::manifest::LoadedManifest;
 use crate::bench::runner::{Driver, RunnerConfig};
 use crate::bench::stats::{Verdict, bootstrap_mean_ci, ci_diff_verdict, pass_at_k, pass_power_k};
 use crate::bench::{Baseline, BenchRepo, Tier, harness_sha, scenarios};
-use sqlx::PgPool;
-use uuid::Uuid;
+use crate::db::DbPool;
 
 const DIM: &str = "\x1b[2m";
 const RESET: &str = "\x1b[0m";
@@ -28,13 +27,13 @@ pub fn list() {
     println!("{DIM}Specs in docs/eval-benchmarks.md.{RESET}");
 }
 
-pub async fn report(pool: &PgPool, run_id: Uuid) -> anyhow::Result<()> {
+pub async fn report(pool: &DbPool, run_id: String) -> anyhow::Result<()> {
     let repo = BenchRepo::new(pool);
     let run = repo
-        .get_run(run_id)
+        .get_run(&run_id.clone())
         .await?
         .ok_or_else(|| anyhow::anyhow!("no bench run with id {run_id}"))?;
-    let results = repo.list_task_results(run_id).await?;
+    let results = repo.list_task_results(&run_id.clone()).await?;
 
     let pass_count = results.iter().filter(|r| r.passed).count();
     let total = results.len();
@@ -76,13 +75,13 @@ pub async fn report(pool: &PgPool, run_id: Uuid) -> anyhow::Result<()> {
 }
 
 pub async fn run(
-    pool: &PgPool,
+    pool: &DbPool,
     scenario_id: &str,
     baseline: Baseline,
     parallelism: i32,
     model: &str,
     seed: Option<i64>,
-) -> anyhow::Result<Uuid> {
+) -> anyhow::Result<String> {
     let spec = scenarios::find(scenario_id)
         .ok_or_else(|| anyhow::anyhow!("unknown scenario: {scenario_id}"))?;
 
@@ -92,7 +91,7 @@ pub async fn run(
             .create_run(spec.id, baseline, parallelism, model, &harness_sha(), seed)
             .await?;
         repo.finalize(
-            run.run_id,
+            &run.run_id,
             false,
             Some("scenario driver not implemented yet"),
         )
@@ -131,14 +130,14 @@ pub async fn run(
     Ok(run_id)
 }
 
-pub async fn diff(pool: &PgPool, a: Uuid, b: Uuid) -> anyhow::Result<()> {
+pub async fn diff(pool: &DbPool, a: String, b: String) -> anyhow::Result<()> {
     let repo = BenchRepo::new(pool);
     let run_a = repo
-        .get_run(a)
+        .get_run(&a.clone())
         .await?
         .ok_or_else(|| anyhow::anyhow!("no bench run {a}"))?;
     let run_b = repo
-        .get_run(b)
+        .get_run(&b.clone())
         .await?
         .ok_or_else(|| anyhow::anyhow!("no bench run {b}"))?;
 
@@ -150,8 +149,8 @@ pub async fn diff(pool: &PgPool, a: Uuid, b: Uuid) -> anyhow::Result<()> {
         );
     }
 
-    let res_a = repo.list_task_results(a).await?;
-    let res_b = repo.list_task_results(b).await?;
+    let res_a = repo.list_task_results(&a).await?;
+    let res_b = repo.list_task_results(&b).await?;
 
     let wall_a: Vec<f64> = res_a.iter().map(|r| r.wall_clock_s as f64).collect();
     let wall_b: Vec<f64> = res_b.iter().map(|r| r.wall_clock_s as f64).collect();
@@ -193,7 +192,7 @@ pub async fn diff(pool: &PgPool, a: Uuid, b: Uuid) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn ci(pool: &PgPool, tier: Tier) -> anyhow::Result<()> {
+pub async fn ci(pool: &DbPool, tier: Tier) -> anyhow::Result<()> {
     let scenario_ids: Vec<&str> = match tier {
         Tier::Smoke => vec!["independent-parallel-n"],
         Tier::Regression => vec![
@@ -224,7 +223,7 @@ pub async fn ci(pool: &PgPool, tier: Tier) -> anyhow::Result<()> {
         )
         .await?;
         let bench = BenchRepo::new(pool)
-            .get_run(run_id)
+            .get_run(&run_id.clone())
             .await?
             .ok_or_else(|| anyhow::anyhow!("just-created run vanished"))?;
         if bench.passed != Some(true) {
@@ -238,7 +237,7 @@ pub async fn ci(pool: &PgPool, tier: Tier) -> anyhow::Result<()> {
 /// Aggregate over the last N runs of (scenario, baseline) to compute pass^k.
 /// Used by `ygg bench ci` regression-gate logic; exposed for tests.
 pub async fn pass_power_k_for(
-    pool: &PgPool,
+    pool: &DbPool,
     scenario: &str,
     baseline: Baseline,
     k: usize,

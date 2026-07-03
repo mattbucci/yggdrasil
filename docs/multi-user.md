@@ -3,7 +3,7 @@
 ## Overview
 
 Yggdrasil partitions data by user identity so multiple humans sharing a
-Postgres instance get isolated namespaces for agents, tasks, locks, nodes,
+database get isolated namespaces for agents, tasks, locks, nodes,
 memories, and events. Cross-user visibility is opt-in.
 
 ## Identity Resolution

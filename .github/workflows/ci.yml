@@ -34,51 +34,15 @@ jobs:
     name: cargo test
     runs-on: ubuntu-latest
 
-    services:
-      postgres:
-        image: pgvector/pgvector:pg16
-        env:
-          POSTGRES_DB: ygg
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 10
-
-    env:
-      DATABASE_URL: postgres://postgres:postgres@localhost:5432/ygg
-
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      - name: Wait for Postgres
-        run: |
-          for i in $(seq 1 20); do
-            if pg_isready -h localhost -p 5432 -U postgres; then
-              echo "postgres ready after ${i}s"
-              exit 0
-            fi
-            sleep 1
-          done
-          echo "postgres failed to become ready in 20s" >&2
-          exit 1
-
-      - name: Run migrations
-        run: |
-          cargo build --release --bin ygg
-          ./target/release/ygg migrate
-
-      - name: Run library tests
-        run: cargo test --lib --quiet
-
-      - name: Run integration tests
-        run: cargo test --test integration --quiet -- --test-threads=1
+      # Embedded SQLite: every test creates its own migrated temp database,
+      # so the whole suite runs with no services and full parallelism.
+      - name: Run tests
+        run: cargo test --quiet
 
   clippy:
     name: clippy

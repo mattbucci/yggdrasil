@@ -50,7 +50,7 @@ enum Commands {
     /// Start ygg — open tmux session with dashboard (default when no command given)
     Up,
 
-    /// Bootstrap dependencies (Postgres, migrations, status bar)
+    /// Bootstrap dependencies (database, migrations, status bar)
     Init {
         /// Show command output for debugging
         #[arg(short, long)]
@@ -1140,13 +1140,11 @@ async fn main() -> anyhow::Result<()> {
                 }
                 RunAction::Heartbeat { run_id, agent } => {
                     let agent = resolve_agent_arg(agent);
-                    let id = run_id
-                        .map(|s| {
-                            uuid::Uuid::parse_str(&s)
-                                .map_err(|e| anyhow::anyhow!("invalid run-id: {e}"))
-                        })
-                        .transpose()?;
-                    ygg::cli::run_cmd::heartbeat_cli(&pool, id, &agent).await?;
+                    if let Some(s) = &run_id {
+                        uuid::Uuid::parse_str(s)
+                            .map_err(|e| anyhow::anyhow!("invalid run-id: {e}"))?;
+                    }
+                    ygg::cli::run_cmd::heartbeat_cli(&pool, run_id, &agent).await?;
                 }
                 RunAction::Finalize {
                     task_ref,
@@ -1159,9 +1157,9 @@ async fn main() -> anyhow::Result<()> {
                         .await?;
                 }
                 RunAction::Show { run_id } => {
-                    let id = uuid::Uuid::parse_str(&run_id)
+                    uuid::Uuid::parse_str(&run_id)
                         .map_err(|e| anyhow::anyhow!("invalid run-id: {e}"))?;
-                    ygg::cli::run_cmd::show_cli(&pool, id).await?;
+                    ygg::cli::run_cmd::show_cli(&pool, run_id).await?;
                 }
                 RunAction::List { task_ref } => {
                     ygg::cli::run_cmd::list_cli(&pool, &task_ref).await?;
@@ -1318,10 +1316,9 @@ async fn main() -> anyhow::Result<()> {
                 }
                 MsgAction::Claim { id, agent } => {
                     let name = agent.unwrap_or_else(default_agent);
-                    let event_id: uuid::Uuid = id
-                        .parse()
+                    uuid::Uuid::parse_str(&id)
                         .map_err(|_| anyhow::anyhow!("invalid UUID: {id}"))?;
-                    ygg::cli::msg_cmd::claim_broadcast(&pool, event_id, &name).await?;
+                    ygg::cli::msg_cmd::claim_broadcast(&pool, id, &name).await?;
                 }
             }
         }
@@ -1352,10 +1349,10 @@ async fn main() -> anyhow::Result<()> {
             let mut total: i64 = 0;
 
             if all || locks {
-                let sql = "DELETE FROM locks WHERE expires_at < now() - ($1 || ' days')::interval";
+                let sql = "DELETE FROM locks WHERE expires_at < strftime('%Y-%m-%dT%H:%M:%f+00:00','now','-' || $1 || ' days')";
                 let n = if dry_run {
                     sqlx::query_scalar::<_, i64>(
-                        "SELECT COUNT(*)::bigint FROM locks WHERE expires_at < now() - ($1 || ' days')::interval"
+                        "SELECT COUNT(*) FROM locks WHERE expires_at < strftime('%Y-%m-%dT%H:%M:%f+00:00','now','-' || $1 || ' days')"
                     ).bind(older_than_days.to_string()).fetch_one(&pool).await.unwrap_or(0)
                 } else {
                     sqlx::query(sql)
@@ -1376,13 +1373,13 @@ async fn main() -> anyhow::Result<()> {
                 // before we delete. Leaves a digest trail intact.
                 let n_closed = if dry_run {
                     sqlx::query_scalar::<_, i64>(
-                        "SELECT COUNT(*)::bigint FROM sessions
-                          WHERE ended_at IS NULL AND updated_at < now() - ($1 || ' days')::interval"
+                        "SELECT COUNT(*) FROM sessions
+                          WHERE ended_at IS NULL AND updated_at < strftime('%Y-%m-%dT%H:%M:%f+00:00','now','-' || $1 || ' days')"
                     ).bind(older_than_days.to_string()).fetch_one(&pool).await.unwrap_or(0)
                 } else {
                     sqlx::query(
                         "UPDATE sessions SET ended_at = updated_at
-                          WHERE ended_at IS NULL AND updated_at < now() - ($1 || ' days')::interval"
+                          WHERE ended_at IS NULL AND updated_at < strftime('%Y-%m-%dT%H:%M:%f+00:00','now','-' || $1 || ' days')"
                     ).bind(older_than_days.to_string()).execute(&pool).await?.rows_affected() as i64
                 };
                 println!(
@@ -1401,7 +1398,7 @@ async fn main() -> anyhow::Result<()> {
                 let n = stale.len() as i64;
                 if !dry_run {
                     for a in &stale {
-                        let _ = repo.archive(a.agent_id).await;
+                        let _ = repo.archive(&a.agent_id).await;
                     }
                 }
                 println!(
@@ -1462,7 +1459,7 @@ async fn main() -> anyhow::Result<()> {
                         .get_by_name(&name)
                         .await?
                         .ok_or_else(|| anyhow::anyhow!("agent '{name}' not found"))?;
-                    repo.archive(agent.agent_id).await?;
+                    repo.archive(&agent.agent_id).await?;
                     println!("archived '{name}'");
                 }
                 AgentAction::Unarchive { name } => {
@@ -1470,7 +1467,7 @@ async fn main() -> anyhow::Result<()> {
                         .get_by_name(&name)
                         .await?
                         .ok_or_else(|| anyhow::anyhow!("agent '{name}' not found"))?;
-                    repo.unarchive(agent.agent_id).await?;
+                    repo.unarchive(&agent.agent_id).await?;
                     println!("restored '{name}'");
                 }
                 AgentAction::Rename { old, new_name } => {
@@ -1480,12 +1477,13 @@ async fn main() -> anyhow::Result<()> {
                         .ok_or_else(|| anyhow::anyhow!("agent '{old}' not found"))?;
                     if old == new_name {
                         println!("noop: '{old}' already named that");
-                    } else if let Err(e) = repo.rename(agent.agent_id, &new_name).await {
-                        // 23505 = unique_violation; surface as friendly error.
-                        let msg = e
+                    } else if let Err(e) = repo.rename(&agent.agent_id, &new_name).await {
+                        // SQLite unique-violation (extended code 2067 =
+                        // SQLITE_CONSTRAINT_UNIQUE); surface as friendly error.
+                        let is_unique = e
                             .as_database_error()
-                            .and_then(|d| d.code().map(|c| c.to_string()));
-                        if msg.as_deref() == Some("23505") {
+                            .is_some_and(|d| d.is_unique_violation());
+                        if is_unique {
                             anyhow::bail!("agent '{new_name}' already exists (with same persona)");
                         } else {
                             return Err(e.into());
@@ -1746,12 +1744,12 @@ async fn main() -> anyhow::Result<()> {
                         .get_by_name(&agent)
                         .await?
                         .map(|a| a.agent_id);
-                    ygg::scheduler::approve(&pool, task.task_id, agent_id).await?;
+                    ygg::scheduler::approve(&pool, &task.task_id, agent_id).await?;
                     println!("{reference} approved");
                 }
                 TaskAction::Unpoison { reference } => {
                     let task = ygg::cli::task_cmd::resolve_task_public(&pool, &reference).await?;
-                    ygg::scheduler::unpoison(&pool, task.task_id).await?;
+                    ygg::scheduler::unpoison(&pool, &task.task_id).await?;
                     println!(
                         "{reference} unpoisoned (status reset to open; latest run flipped failed)"
                     );
@@ -1783,7 +1781,7 @@ async fn main() -> anyhow::Result<()> {
                     let task = ygg::cli::task_cmd::resolve_task_public(&pool, &reference).await?;
                     let new_value = !off;
                     sqlx::query(
-                        "UPDATE tasks SET runnable = $1, updated_at = now() WHERE task_id = $2",
+                        "UPDATE tasks SET runnable = $1, updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now') WHERE task_id = $2",
                     )
                     .bind(new_value)
                     .bind(task.task_id)
@@ -1894,17 +1892,15 @@ async fn main() -> anyhow::Result<()> {
                     .await?;
             }
             BenchAction::Report { run_id } => {
-                let id = uuid::Uuid::parse_str(&run_id)
+                uuid::Uuid::parse_str(&run_id)
                     .map_err(|e| anyhow::anyhow!("invalid run-id: {e}"))?;
                 let config = ygg::config::AppConfig::from_env()?;
                 let pool = ygg::db::create_pool(&config.database_url).await?;
-                ygg::cli::bench_cmd::report(&pool, id).await?;
+                ygg::cli::bench_cmd::report(&pool, run_id).await?;
             }
             BenchAction::Diff { a, b } => {
-                let a = uuid::Uuid::parse_str(&a)
-                    .map_err(|e| anyhow::anyhow!("invalid run-id a: {e}"))?;
-                let b = uuid::Uuid::parse_str(&b)
-                    .map_err(|e| anyhow::anyhow!("invalid run-id b: {e}"))?;
+                uuid::Uuid::parse_str(&a).map_err(|e| anyhow::anyhow!("invalid run-id a: {e}"))?;
+                uuid::Uuid::parse_str(&b).map_err(|e| anyhow::anyhow!("invalid run-id b: {e}"))?;
                 let config = ygg::config::AppConfig::from_env()?;
                 let pool = ygg::db::create_pool(&config.database_url).await?;
                 ygg::cli::bench_cmd::diff(&pool, a, b).await?;
@@ -2033,21 +2029,21 @@ async fn main() -> anyhow::Result<()> {
             let pool = ygg::db::create_pool(&config.database_url).await?;
             // Mirrors the task-cmd resolver so `ygg worktree ensure ygg-abcd`
             // or `yggdrasil-42` both work.
-            async fn resolve_id(pool: &sqlx::PgPool, r: &str) -> Result<uuid::Uuid, anyhow::Error> {
-                if let Ok(u) = uuid::Uuid::parse_str(r) {
-                    return Ok(u);
+            async fn resolve_id(pool: &ygg::db::DbPool, r: &str) -> Result<String, anyhow::Error> {
+                if uuid::Uuid::parse_str(r).is_ok() {
+                    return Ok(r.to_lowercase());
                 }
                 let hex = r.strip_prefix("ygg-").unwrap_or(r);
                 if hex.len() >= 6 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
-                    let m: Vec<uuid::Uuid> = sqlx::query_scalar(
-                        "SELECT task_id FROM tasks WHERE task_id::text LIKE $1 LIMIT 5",
+                    let m: Vec<String> = sqlx::query_scalar(
+                        "SELECT task_id FROM tasks WHERE task_id LIKE $1 LIMIT 5",
                     )
                     .bind(format!("{hex}%"))
                     .fetch_all(pool)
                     .await?;
                     match m.len() {
                         0 => {}
-                        1 => return Ok(m[0]),
+                        1 => return Ok(m[0].clone()),
                         n => anyhow::bail!("ambiguous '{r}' ({n} matches)"),
                     }
                 }
@@ -2060,7 +2056,7 @@ async fn main() -> anyhow::Result<()> {
                     .await?
                     .ok_or_else(|| anyhow::anyhow!("no repo '{prefix}'"))?;
                 let t = ygg::models::task::TaskRepo::new(pool)
-                    .get_by_ref(repo.repo_id, seq)
+                    .get_by_ref(&repo.repo_id, seq)
                     .await?
                     .ok_or_else(|| anyhow::anyhow!("no task {r}"))?;
                 Ok(t.task_id)
@@ -2179,15 +2175,15 @@ async fn main() -> anyhow::Result<()> {
                     ygg::cli::learning_cmd::pending(&pool, all, json).await?;
                 }
                 LearnAction::Approve { id, agent } => {
-                    let uuid = uuid::Uuid::parse_str(&id)
+                    uuid::Uuid::parse_str(&id)
                         .map_err(|_| anyhow::anyhow!("invalid uuid: {id}"))?;
                     let agent_name = agent.unwrap_or_else(agent_name_default);
-                    ygg::cli::learning_cmd::approve(&pool, uuid, &agent_name).await?;
+                    ygg::cli::learning_cmd::approve(&pool, id, &agent_name).await?;
                 }
                 LearnAction::Reject { id, reason } => {
-                    let uuid = uuid::Uuid::parse_str(&id)
+                    uuid::Uuid::parse_str(&id)
                         .map_err(|_| anyhow::anyhow!("invalid uuid: {id}"))?;
-                    ygg::cli::learning_cmd::reject(&pool, uuid, reason.as_deref()).await?;
+                    ygg::cli::learning_cmd::reject(&pool, id, reason.as_deref()).await?;
                 }
                 LearnAction::List {
                     file,
@@ -2205,9 +2201,9 @@ async fn main() -> anyhow::Result<()> {
                     .await?;
                 }
                 LearnAction::Delete { id } => {
-                    let uuid = uuid::Uuid::parse_str(&id)
+                    uuid::Uuid::parse_str(&id)
                         .map_err(|_| anyhow::anyhow!("invalid uuid: {id}"))?;
-                    ygg::cli::learning_cmd::delete(&pool, uuid).await?;
+                    ygg::cli::learning_cmd::delete(&pool, id).await?;
                 }
             }
         }

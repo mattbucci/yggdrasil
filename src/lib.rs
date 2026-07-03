@@ -1,6 +1,7 @@
 pub mod analytics;
 pub mod bench;
 pub mod blob;
+pub mod bus;
 pub mod cli;
 pub mod config;
 pub mod db;
@@ -18,13 +19,12 @@ pub mod tui;
 pub mod watcher;
 pub mod worktree;
 
-use sqlx::PgPool;
-use uuid::Uuid;
+use crate::db::DbPool;
 
 /// Shared application state threaded through all subsystems.
 pub struct AppState {
-    pub pool: PgPool,
-    pub agent_id: Uuid,
+    pub pool: DbPool,
+    pub agent_id: String,
     pub config: config::AppConfig,
 }
 

@@ -4,7 +4,7 @@
 
 ## The runtime in one paragraph
 
-A single long-lived `ygg scheduler` daemon is the only writer of task-execution state. On a 1–5 second tick (and whenever Postgres NOTIFY fires a new-ready-work event) it claims ready tasks with `SELECT … FOR UPDATE SKIP LOCKED`, inserts a `task_runs` row per claim, calls the existing `ygg spawn` to launch a Claude Code agent in a tmux window, and records the binding. Spawned agents are passive — they run, produce output, touch files, commit, push, and stop. The existing `Stop` hook writes outcome data (commit SHAs, result summary, exit code) into the run row. The scheduler reads that data on its next tick, closes the run, releases locks, and advances downstream tasks. Retries, deadlines, and loop detection are the scheduler's responsibility; agents never retry themselves. The runtime has no LLM in its dispatch path — the expensive substrate does the work; the cheap substrate decides what work to do.
+A single long-lived `ygg scheduler` daemon is the only writer of task-execution state. On a 1–5 second tick (and whenever a datagram on the unix-socket event bus signals new-ready-work — see below) it claims ready tasks with an atomic `ready → running` UPDATE inside a `BEGIN IMMEDIATE` SQLite transaction (the post-Postgres replacement for `FOR UPDATE SKIP LOCKED`), inserts a `task_runs` row per claim, calls the existing `ygg spawn` to launch a Claude Code agent in a tmux window, and records the binding. Spawned agents are passive — they run, produce output, touch files, commit, push, and stop. The existing `Stop` hook writes outcome data (commit SHAs, result summary, exit code) into the run row. The scheduler reads that data on its next tick, closes the run, releases locks, and advances downstream tasks. Retries, deadlines, and loop detection are the scheduler's responsibility; agents never retry themselves. The runtime has no LLM in its dispatch path — the expensive substrate does the work; the cheap substrate decides what work to do.
 
 ## The actors
 
@@ -14,7 +14,7 @@ flowchart TD
         SCH[authority for task_runs state transitions<br/>no LLM calls, ever]
     end
 
-    subgraph PG["Postgres"]
+    subgraph PG["SQLite (embedded, WAL)"]
         T[(tasks)]
         TR[(task_runs<br/><i>writer: scheduler only*</i>)]
         L[(locks)]
@@ -33,7 +33,7 @@ flowchart TD
     HK([pre-tool-use hook]) --> L
     HKE([all hooks]) --> E
 
-    S -- NOTIFY / 1-5s tick --> PG
+    S -- socket-bus wake / 1-5s tick --> PG
     S -- spawn --> TM
     A1 --> |"commits / locks / events / messages"| PG
     A2 --> PG
@@ -50,11 +50,11 @@ Legacy ASCII rendering, for terminals without mermaid support:
 │   authority for task_runs state transitions                    │
 │   no LLM calls, ever                                           │
 └──────────────┬─────────────────────────────────────────────────┘
-               │ NOTIFY wake-up OR 1–5s tick
+               │ socket-bus wake-up OR 1–5s tick
                │
                ▼
         ┌──────────────┐
-        │   Postgres   │
+        │    SQLite    │
         │   tasks      │◄──── writers: ygg task CLI, humans
         │   task_runs  │◄──── writer: scheduler only (*)
         │   locks      │◄──── writers: pre-tool-use hook, CLI
@@ -89,7 +89,7 @@ stateDiagram-v2
     [*] --> scheduled
     scheduled --> ready: deps satisfied
     scheduled --> cancelled: cancel
-    ready --> running: claim (SKIP LOCKED)
+    ready --> running: claim (BEGIN IMMEDIATE)
     ready --> cancelled: cancel
     running --> succeeded: agent succeeded
     running --> failed: agent reports failure
@@ -111,7 +111,7 @@ The legacy ASCII rendering follows for terminals without mermaid support:
        ┌───────────┐   scheduler picks              ┌───────────┐
        │ scheduled │──── deps satisfied ──────────► │   ready   │
        └─────┬─────┘                                └─────┬─────┘
-             │ cancel                                     │ claim (SKIP LOCKED)
+             │ cancel                                     │ claim (BEGIN IMMEDIATE)
              ▼                                            ▼
        ┌───────────┐                                ┌───────────┐
        │ cancelled │                          ┌────│  running  │─────┐
@@ -164,7 +164,7 @@ loop {
         // Zero-latency wake-up on new ready work or finished attempts.
         notification = listen("task_events") => tick(),
 
-        // Safety net — LISTEN/NOTIFY can drop messages.
+        // Safety net — the fire-and-forget socket bus can drop datagrams.
         _ = sleep(tick_interval) => tick(),
     }
 }
@@ -175,7 +175,7 @@ fn tick() -> Result<()> {
     // (1) Reconcile: terminal runs whose outcome has been written but state not advanced.
     for run in runs_awaiting_finalize() {
         capture_outcome(run)?;   // read hook-written fields, compute state
-        close_run(run)?;         // release locks, NOTIFY task_events
+        close_run(run)?;         // release locks, emit task_events
     }
 
     // (2) Reap: heartbeat-expired running attempts.
@@ -199,7 +199,7 @@ fn tick() -> Result<()> {
     }
 
     // (5) Dispatch: claim ready runs up to budget.
-    let claimed = claim_ready(budget)?;  // SELECT … FOR UPDATE SKIP LOCKED
+    let claimed = claim_ready(budget)?;  // atomic ready→running UPDATE (BEGIN IMMEDIATE)
     for run in claimed {
         if requires_approval(run) && !approved(run) {
             continue;  // held until human approves; remains 'ready'

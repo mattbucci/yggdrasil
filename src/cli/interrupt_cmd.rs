@@ -1,8 +1,8 @@
 use crate::config::AppConfig;
-use sqlx::PgPool;
+use crate::db::DbPool;
 
 pub async fn execute_take_over(
-    pool: &PgPool,
+    pool: &DbPool,
     config: &AppConfig,
     agent: &str,
 ) -> Result<(), anyhow::Error> {
@@ -18,7 +18,7 @@ pub async fn execute_take_over(
 }
 
 pub async fn execute_hand_back(
-    pool: &PgPool,
+    pool: &DbPool,
     _config: &AppConfig,
     agent: &str,
 ) -> Result<(), anyhow::Error> {

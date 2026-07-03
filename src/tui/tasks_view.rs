@@ -4,10 +4,9 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::db::DbPool;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
-use sqlx::PgPool;
-use uuid::Uuid;
 
 use crate::models::repo::RepoRepo;
 use crate::models::task::{Task, TaskKind, TaskRepo, TaskStatus};
@@ -31,12 +30,18 @@ pub struct TasksView {
     /// Armed by Backspace; next key must be `y` to actually delete.
     /// Carries the display label so the confirm prompt stays accurate
     /// even if the selection moves.
-    pub pending_delete: Option<(Uuid, String)>,
+    pub pending_delete: Option<(String, String)>,
     /// yggdrasil-155: inline rename buffer. `Some((task_id, edited_title))`
     /// while the user is editing the selected row's title in place; commit
     /// writes back via TaskRepo::update, cancel discards. None means the
     /// pane is in normal nav mode.
-    pub rename: Option<(Uuid, String)>,
+    pub rename: Option<(String, String)>,
+}
+
+impl Default for TasksView {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TasksView {
@@ -67,7 +72,7 @@ impl TasksView {
             return;
         };
         if let Some(TaskRow::Task { task, .. }) = self.rows.get(i) {
-            self.rename = Some((task.task_id, task.title.clone()));
+            self.rename = Some((task.task_id.clone(), task.title.clone()));
         }
     }
 
@@ -93,7 +98,7 @@ impl TasksView {
 
     /// Commit the rename to the database and clear the buffer. Reload
     /// happens on the caller's next refresh tick.
-    pub async fn rename_commit(&mut self, pool: &PgPool) -> Result<(), anyhow::Error> {
+    pub async fn rename_commit(&mut self, pool: &DbPool) -> Result<(), anyhow::Error> {
         let Some((task_id, title)) = self.rename.take() else {
             return Ok(());
         };
@@ -106,7 +111,7 @@ impl TasksView {
         }
         TaskRepo::new(pool)
             .update(
-                task_id,
+                &task_id,
                 None,
                 crate::models::task::TaskUpdate {
                     title: Some(trimmed),
@@ -119,11 +124,11 @@ impl TasksView {
     }
 
     /// task_id + display label ("yggdrasil-42") for the selected row, if any.
-    pub fn selected_task_id(&self) -> Option<(Uuid, String)> {
+    pub fn selected_task_id(&self) -> Option<(String, String)> {
         let i = self.state.selected()?;
         match self.rows.get(i)? {
             TaskRow::Task { prefix, task } => {
-                Some((task.task_id, format!("{prefix}-{}", task.seq)))
+                Some((task.task_id.clone(), format!("{prefix}-{}", task.seq)))
             }
             _ => None,
         }
@@ -135,17 +140,17 @@ impl TasksView {
     pub fn delete_cancel(&mut self) {
         self.pending_delete = None;
     }
-    pub fn take_pending_delete(&mut self) -> Option<Uuid> {
+    pub fn take_pending_delete(&mut self) -> Option<String> {
         self.pending_delete.take().map(|(id, _)| id)
     }
 
-    pub async fn refresh(&mut self, pool: &PgPool) -> Result<(), anyhow::Error> {
+    pub async fn refresh(&mut self, pool: &DbPool) -> Result<(), anyhow::Error> {
         self.last_status.clear();
         self.loaded = true;
         let repos = RepoRepo::new(pool).list().await.unwrap_or_default();
-        let prefix_by_repo: HashMap<Uuid, String> = repos
+        let prefix_by_repo: HashMap<String, String> = repos
             .iter()
-            .map(|r| (r.repo_id, r.task_prefix.clone()))
+            .map(|r| (r.repo_id.clone(), r.task_prefix.clone()))
             .collect();
 
         let tasks: Vec<Task> = TaskRepo::new(pool)
@@ -156,17 +161,18 @@ impl TasksView {
             .filter(|t| t.status != TaskStatus::Closed)
             .collect();
 
-        let task_ids: Vec<Uuid> = tasks.iter().map(|t| t.task_id).collect();
-        let edges: Vec<(Uuid, Uuid)> = sqlx::query_as::<_, (Uuid, Uuid)>(
-            "SELECT task_id, blocker_id FROM task_deps WHERE task_id = ANY($1)",
+        let task_ids: Vec<String> = tasks.iter().map(|t| t.task_id.clone()).collect();
+        let edges: Vec<(String, String)> = sqlx::query_as::<_, (String, String)>(
+            "SELECT task_id, blocker_id FROM task_deps
+              WHERE task_id IN (SELECT value FROM json_each($1))",
         )
-        .bind(&task_ids)
+        .bind(serde_json::to_string(&task_ids).unwrap_or_default())
         .fetch_all(pool)
         .await
         .unwrap_or_default();
 
         // A task is blocked iff one of its blockers is still open/in-progress.
-        let open_ids: HashSet<Uuid> = tasks
+        let open_ids: HashSet<String> = tasks
             .iter()
             .filter(|t| {
                 matches!(
@@ -174,12 +180,12 @@ impl TasksView {
                     TaskStatus::Open | TaskStatus::InProgress | TaskStatus::Blocked
                 )
             })
-            .map(|t| t.task_id)
+            .map(|t| t.task_id.clone())
             .collect();
-        let mut blocked: HashSet<Uuid> = HashSet::new();
+        let mut blocked: HashSet<String> = HashSet::new();
         for (tid, bid) in &edges {
             if open_ids.contains(bid) {
-                blocked.insert(*tid);
+                blocked.insert(tid.clone());
             }
         }
 
@@ -393,10 +399,10 @@ impl TasksView {
 
         frame.render_stateful_widget(table, area, &mut self.state);
 
-        if self.detail_open {
-            if let Some((task, prefix)) = self.selected_task() {
-                crate::tui::dag_view::render_detail_overlay(frame, area, task, prefix);
-            }
+        if self.detail_open
+            && let Some((task, prefix)) = self.selected_task()
+        {
+            crate::tui::dag_view::render_detail_overlay(frame, area, task, prefix);
         }
     }
 }

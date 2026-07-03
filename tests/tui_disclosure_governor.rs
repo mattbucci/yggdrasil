@@ -49,7 +49,7 @@ fn rolling_window_caps_total_disclosures() {
         t = t + GLOBAL_COOLDOWN + Duration::from_secs(1);
     }
     // One more inside the window must be gated.
-    let sender = format!("a-overflow");
+    let sender = "a-overflow".to_string();
     assert!(
         !g.try_admit_at(&sender, 1.0, t),
         "overflow fire must be blocked"

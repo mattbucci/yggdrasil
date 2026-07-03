@@ -143,7 +143,7 @@ async fn handle_prompt_submit(
                     Ok(Some(agent)) => {
                         if let Err(e) = crate::stats::tracker::replace_stats(
                             &pool,
-                            agent.agent_id,
+                            &agent.agent_id,
                             &usage,
                             &category,
                         )
@@ -235,7 +235,7 @@ async fn handle_pre_tool_use(agent_name: &str, payload: &serde_json::Value) -> a
             };
 
             let lock_mgr = LockManager::new(&pool, config.lock_ttl_secs, crate::db::user_id());
-            match lock_mgr.acquire(file_path, agent.agent_id).await {
+            match lock_mgr.acquire(file_path, &agent.agent_id).await {
                 Ok(_) => {} // Lock acquired silently.
                 Err(e) => {
                     let msg = e.to_string();
@@ -333,7 +333,7 @@ async fn handle_stop(agent_name: &str, payload: &serde_json::Value) -> anyhow::R
                         turns.iter().flat_map(|t| t.tool_names.clone()).collect();
                     let category = crate::stats::classifier::classify(&tool_names);
                     if let Err(e) =
-                        crate::stats::tracker::replace_stats(pool, a.agent_id, &usage, &category)
+                        crate::stats::tracker::replace_stats(pool, &a.agent_id, &usage, &category)
                             .await
                     {
                         warn!("hook stop: replace_stats failed: {e}");
@@ -342,20 +342,24 @@ async fn handle_stop(agent_name: &str, payload: &serde_json::Value) -> anyhow::R
             }
 
             if let Some(sid) =
-                crate::models::session::resolve_current_session(pool, a.agent_id, None).await
+                crate::models::session::resolve_current_session(pool, &a.agent_id, None).await
             {
                 let _ = crate::models::session::SessionRepo::new(pool)
-                    .end(sid)
+                    .end(&sid)
                     .await;
             }
             let lock_mgr = LockManager::new(pool, config.lock_ttl_secs, &user_id);
-            let _ = lock_mgr.release_all_for_agent(a.agent_id).await;
+            let _ = lock_mgr.release_all_for_agent(&a.agent_id).await;
 
             // Mark the agent Shutdown. Subsequent prompts re-enter Executing
             // via inject (force_state is unconditional); the watcher's reap
             // pass will close the tmux window once the process is truly gone.
             let _ = AgentRepo::new(pool, &user_id)
-                .force_state(a.agent_id, crate::models::agent::AgentState::Shutdown, None)
+                .force_state(
+                    &a.agent_id,
+                    crate::models::agent::AgentState::Shutdown,
+                    None,
+                )
                 .await;
         }
 

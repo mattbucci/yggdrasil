@@ -2,15 +2,12 @@
 //! embeddings). Verifies repo-scoped vs global write and the prime/list
 //! retrieval semantics (repo notes + global, newest-first).
 //!
-//! Requires Postgres + migrations applied:
-//!     DATABASE_URL=postgres://ng@localhost:5432/ygg cargo test --test remember -- --test-threads=1
 
-use std::env;
-use uuid::Uuid;
+mod common;
 use ygg::models::memory::MemoryRepo;
 use ygg::models::repo::RepoRepo;
 
-async fn make_repo(pool: &sqlx::PgPool, prefix: &str) -> Uuid {
+async fn make_repo(pool: &ygg::db::DbPool, prefix: &str) -> String {
     RepoRepo::new(pool)
         .register(None, prefix, prefix, Some(&format!("/tmp/{prefix}")))
         .await
@@ -18,7 +15,7 @@ async fn make_repo(pool: &sqlx::PgPool, prefix: &str) -> Uuid {
         .repo_id
 }
 
-async fn teardown(pool: &sqlx::PgPool, repo_ids: &[Uuid]) {
+async fn teardown(pool: &ygg::db::DbPool, repo_ids: &[String]) {
     // memories cascade on repo delete; global notes are removed explicitly.
     for id in repo_ids {
         sqlx::query("DELETE FROM repos WHERE repo_id = $1")
@@ -31,19 +28,24 @@ async fn teardown(pool: &sqlx::PgPool, repo_ids: &[Uuid]) {
 
 #[tokio::test]
 async fn repo_scoped_list_includes_global_notes() {
-    let db_url = env::var("DATABASE_URL").expect("DATABASE_URL required");
-    let pool = ygg::db::create_pool(&db_url).await.unwrap();
+    let pool = common::test_db().await;
     let repo_a = make_repo(&pool, "memrepoa").await;
     let repo_b = make_repo(&pool, "memrepob").await;
     let mem = MemoryRepo::new(&pool);
 
-    let a_note = mem.create(Some(repo_a), "note in A", None).await.unwrap();
-    let b_note = mem.create(Some(repo_b), "note in B", None).await.unwrap();
+    let a_note = mem
+        .create(Some(repo_a.clone()), "note in A", None)
+        .await
+        .unwrap();
+    let b_note = mem
+        .create(Some(repo_b.clone()), "note in B", None)
+        .await
+        .unwrap();
     let g_note = mem.create(None, "global note", None).await.unwrap();
 
     // Repo A's view: its own note + the global one, never repo B's.
-    let view = mem.list(Some(repo_a), false, 50).await.unwrap();
-    let ids: Vec<Uuid> = view.iter().map(|m| m.memory_id).collect();
+    let view = mem.list(Some(repo_a.clone()), false, 50).await.unwrap();
+    let ids: Vec<String> = view.iter().map(|m| m.memory_id.clone()).collect();
     assert!(ids.contains(&a_note.memory_id), "repo A note must appear");
     assert!(ids.contains(&g_note.memory_id), "global note must appear");
     assert!(
@@ -58,17 +60,22 @@ async fn repo_scoped_list_includes_global_notes() {
 
 #[tokio::test]
 async fn all_flag_crosses_repos_and_newest_first() {
-    let db_url = env::var("DATABASE_URL").expect("DATABASE_URL required");
-    let pool = ygg::db::create_pool(&db_url).await.unwrap();
+    let pool = common::test_db().await;
     let repo_a = make_repo(&pool, "memalla").await;
     let repo_b = make_repo(&pool, "memallb").await;
     let mem = MemoryRepo::new(&pool);
 
-    let first = mem.create(Some(repo_a), "older", None).await.unwrap();
-    let second = mem.create(Some(repo_b), "newer", None).await.unwrap();
+    let first = mem
+        .create(Some(repo_a.clone()), "older", None)
+        .await
+        .unwrap();
+    let second = mem
+        .create(Some(repo_b.clone()), "newer", None)
+        .await
+        .unwrap();
 
     let all = mem.list(None, true, 50).await.unwrap();
-    let ids: Vec<Uuid> = all.iter().map(|m| m.memory_id).collect();
+    let ids: Vec<String> = all.iter().map(|m| m.memory_id.clone()).collect();
     assert!(ids.contains(&first.memory_id));
     assert!(ids.contains(&second.memory_id));
 

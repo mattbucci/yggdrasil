@@ -21,12 +21,15 @@ cargo install --path .
 ## Requirements
 
 - **Rust 1.75+** (build from source only)
-- **PostgreSQL 14+**
+
+The database is an embedded SQLite file (created automatically at
+`$XDG_DATA_HOME/ygg/ygg.db`, fallback `~/.local/share/ygg/ygg.db`) — no
+database server to install or run.
 
 ## Quick Start
 
 ```bash
-# 1. Bootstrap everything: Postgres check, migrations, hooks
+# 1. Bootstrap everything: data dir + migrations, hooks
 ygg init
 
 # 2. Create a task
@@ -46,7 +49,7 @@ ygg status
 
 ```text
 +------------------+         +-------------------------------+
-|   Claude Code    |         |          PostgreSQL           |
+|   Claude Code    |         |     SQLite (embedded, WAL)    |
 |                  |         |                               |
 |  SessionStart  --+--ygg-->|  agents   (state machine)     |
 |  UserPromptSubmit+--msg--->|  events   (live stream)       |
@@ -54,12 +57,15 @@ ygg status
 |  PreCompact    --+-prime-->|  tasks    (tracking + deps)   |
 |  PreToolUse    --+--lock-->|  task_runs(scheduler runs)    |
 +------------------+         +-------------------------------+
-        |                                |
-        v                                v
-   tmux windows                 +------------------+
-   (one per agent)              |   TUI Dashboard  |
-                                |   (ratatui)      |
-                                +------------------+
+        |                          |               |
+        |            unix socket bus (ygg.sock)    |
+        |            wakes the scheduler on events |
+        v                          v               v
+   tmux windows           +---------------+  +--------------+
+   (one per agent)        | ygg scheduler |  | TUI Dashboard|
+                          | (file-locked  |  |  (ratatui)   |
+                          |  singleton)   |  +--------------+
+                          +---------------+
 ```
 
 Hooks (installed by `ygg init` as native `ygg hook <event>` handlers) fire at Claude Code lifecycle events:
@@ -82,13 +88,13 @@ Yggdrasil focuses on the parts that are hard to get in one place:
 - **Inter-agent messaging** delivered at the recipient's next turn.
 - **Live event streams** and a TUI dashboard for humans watching multiple agents at once.
 
-One deliberate design choice: Yggdrasil is **global per user**, not per repo. One Postgres instance backs every repo you work in; agents are auto-keyed by the basename of the current working directory. The trade-off is documented in [ADR 0008](docs/adr/0008-shared-db-across-repos.md) and [Open questions](docs/open-questions.md).
+One deliberate design choice: Yggdrasil is **global per user**, not per repo. One SQLite database backs every repo you work in; agents are auto-keyed by the basename of the current working directory. The trade-off is documented in [ADR 0008](docs/adr/0008-shared-db-across-repos.md) and [Open questions](docs/open-questions.md).
 
 ## Subcommand Reference
 
 | Command     | Purpose                                                                 |
 |-------------|-------------------------------------------------------------------------|
-| `init`      | Bootstrap: Postgres check, migrations, hooks.                          |
+| `init`      | Bootstrap: data dir + migrations, hooks.                               |
 | `up`        | Launch the tmux dashboard (default when run bare).                     |
 | `dashboard` | Launch the TUI dashboard directly.                                      |
 | `status`    | Quick text output of agent + system state.                              |
@@ -128,16 +134,15 @@ src/
   status.rs     status aggregation
   tmux.rs       tmux window management
   watcher.rs    background daemon
-migrations/     Postgres schema
+migrations/     SQLite schema
 docs/           prose docs + ADRs
 ```
 
 ## Build from Source
 
 ```bash
-docker-compose up -d             # Postgres 16
 cargo build --release            # build the ygg binary
-cargo test                       # run tests (requires Postgres)
+cargo test                       # run tests (embedded SQLite; no services needed)
 make install                     # build + install to ~/.local/bin/ygg
 ```
 

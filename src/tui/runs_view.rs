@@ -1,10 +1,10 @@
 //! Runs tab — recent task_runs (yggdrasil-101). Read-only for the MVP;
 //! interactive requeue / cancel land per a follow-up. Switches in via Shift+R.
 
+use crate::db::DbPool;
 use chrono::{DateTime, Utc};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
-use sqlx::PgPool;
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -34,6 +34,12 @@ enum Filter {
     Terminal,
 }
 
+impl Default for RunsView {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RunsView {
     pub fn new() -> Self {
         Self {
@@ -60,7 +66,7 @@ impl RunsView {
         self.selected = self.selected.saturating_sub(1);
     }
 
-    pub async fn refresh(&mut self, pool: &PgPool) -> Result<(), anyhow::Error> {
+    pub async fn refresh(&mut self, pool: &DbPool) -> Result<(), anyhow::Error> {
         let where_clause = match self.filter {
             Filter::All => "TRUE",
             Filter::Live => "tr.state IN ('scheduled','ready','running','retrying')",
@@ -69,7 +75,7 @@ impl RunsView {
 
         let sql = format!(
             r#"SELECT r.task_prefix, t.seq, t.title, tr.attempt,
-                      tr.state::text, tr.reason::text,
+                      tr.state, tr.reason,
                       ag.agent_name, tr.started_at, tr.ended_at, tr.output_commit_sha
                  FROM task_runs tr
                  JOIN tasks t ON t.task_id = tr.task_id
@@ -231,7 +237,7 @@ fn state_style(state: &str) -> (Color, &'static str) {
 }
 
 #[allow(dead_code)]
-fn _suppress_unused(p: &PgPool) -> &PgPool {
-    let _: Uuid = Uuid::nil();
+fn _suppress_unused(p: &DbPool) -> &DbPool {
+    let _: String = Uuid::nil().to_string();
     p
 }

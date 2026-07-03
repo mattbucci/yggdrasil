@@ -1,10 +1,10 @@
 //! Live log viewer — events table tail inside the TUI. `f` cycles a
 //! kind filter, arrows scroll, `r` forces refresh.
 
+use crate::db::DbPool;
 use chrono::{DateTime, Utc};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
-use sqlx::PgPool;
 
 const FILTERS: &[&str] = &[
     "all",
@@ -27,6 +27,12 @@ pub struct LogView {
     pub state: ListState,
     pub limit: i64,
     pub detail_open: bool,
+}
+
+impl Default for LogView {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl LogView {
@@ -54,10 +60,10 @@ impl LogView {
         self.filter_idx = (self.filter_idx + 1) % FILTERS.len();
     }
 
-    pub async fn refresh(&mut self, pool: &PgPool) -> Result<(), anyhow::Error> {
+    pub async fn refresh(&mut self, pool: &DbPool) -> Result<(), anyhow::Error> {
         let rows = if self.filter() == "all" {
             sqlx::query_as::<_, (DateTime<Utc>, String, String, serde_json::Value)>(
-                "SELECT created_at, event_kind::text, agent_name, payload
+                "SELECT created_at, event_kind, agent_name, payload
                  FROM events ORDER BY created_at DESC LIMIT $1",
             )
             .bind(self.limit)
@@ -66,8 +72,8 @@ impl LogView {
             .unwrap_or_default()
         } else {
             sqlx::query_as(
-                "SELECT created_at, event_kind::text, agent_name, payload
-                 FROM events WHERE event_kind::text = $1
+                "SELECT created_at, event_kind, agent_name, payload
+                 FROM events WHERE event_kind = $1
                  ORDER BY created_at DESC LIMIT $2",
             )
             .bind(self.filter())

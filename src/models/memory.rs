@@ -5,32 +5,33 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, PgPool};
-use uuid::Uuid;
+use sqlx::FromRow;
+
+use crate::db::DbPool;
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct Memory {
-    pub memory_id: Uuid,
-    pub repo_id: Option<Uuid>,
+    pub memory_id: String,
+    pub repo_id: Option<String>,
     pub text: String,
-    pub created_by: Option<Uuid>,
+    pub created_by: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
 pub struct MemoryRepo<'a> {
-    pool: &'a PgPool,
+    pool: &'a DbPool,
 }
 
 impl<'a> MemoryRepo<'a> {
-    pub fn new(pool: &'a PgPool) -> Self {
+    pub fn new(pool: &'a DbPool) -> Self {
         Self { pool }
     }
 
     pub async fn create(
         &self,
-        repo_id: Option<Uuid>,
+        repo_id: Option<String>,
         text: &str,
-        created_by: Option<Uuid>,
+        created_by: Option<String>,
     ) -> Result<Memory, sqlx::Error> {
         sqlx::query_as::<_, Memory>(
             r#"INSERT INTO memories (repo_id, text, created_by)
@@ -49,17 +50,17 @@ impl<'a> MemoryRepo<'a> {
     /// every note; `repo_id = None` with `all = false` returns global-only.
     pub async fn list(
         &self,
-        repo_id: Option<Uuid>,
+        repo_id: Option<String>,
         all: bool,
         limit: i64,
     ) -> Result<Vec<Memory>, sqlx::Error> {
         sqlx::query_as::<_, Memory>(
             r#"SELECT memory_id, repo_id, text, created_by, created_at
                FROM memories
-               WHERE ($2::bool IS TRUE)
-                  OR ($1::UUID IS NULL AND repo_id IS NULL)
+               WHERE ($2 IS TRUE)
+                  OR ($1 IS NULL AND repo_id IS NULL)
                   OR (repo_id = $1 OR repo_id IS NULL)
-               ORDER BY created_at DESC
+               ORDER BY created_at DESC, rowid DESC
                LIMIT $3"#,
         )
         .bind(repo_id)
@@ -69,7 +70,7 @@ impl<'a> MemoryRepo<'a> {
         .await
     }
 
-    pub async fn delete(&self, memory_id: Uuid) -> Result<bool, sqlx::Error> {
+    pub async fn delete(&self, memory_id: String) -> Result<bool, sqlx::Error> {
         let n = sqlx::query("DELETE FROM memories WHERE memory_id = $1")
             .bind(memory_id)
             .execute(self.pool)

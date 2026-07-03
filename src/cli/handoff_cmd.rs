@@ -6,13 +6,15 @@
 use crate::cli::task_cmd::resolve_cwd_repo;
 use crate::models::agent::AgentRepo;
 use crate::models::handoff::HandoffRepo;
-use uuid::Uuid;
 
 /// Resolve the agent_id the same way `ygg prime` does — `register_with_persona`
 /// keyed by (name, $YGG_AGENT_PERSONA) — so a handoff saved here is fetched
 /// under the identical agent on the next prime. A raw name lookup is ambiguous
 /// when the same name exists under multiple personas.
-async fn resolve_agent_id(pool: &sqlx::PgPool, agent_name: &str) -> Result<Uuid, anyhow::Error> {
+async fn resolve_agent_id(
+    pool: &crate::db::DbPool,
+    agent_name: &str,
+) -> Result<String, anyhow::Error> {
     let persona = std::env::var("YGG_AGENT_PERSONA")
         .ok()
         .filter(|s| !s.is_empty());
@@ -26,7 +28,7 @@ async fn resolve_agent_id(pool: &sqlx::PgPool, agent_name: &str) -> Result<Uuid,
 }
 
 pub async fn save(
-    pool: &sqlx::PgPool,
+    pool: &crate::db::DbPool,
     text: &str,
     agent_name: &str,
     json: bool,
@@ -40,7 +42,7 @@ pub async fn save(
     let agent_id = resolve_agent_id(pool, agent_name).await?;
 
     let handoff = HandoffRepo::new(pool)
-        .save(repo_id, Some(agent_id), text)
+        .save(repo_id.clone(), Some(agent_id), text)
         .await?;
 
     if json {
@@ -59,7 +61,11 @@ pub async fn save(
     Ok(())
 }
 
-pub async fn show(pool: &sqlx::PgPool, agent_name: &str, json: bool) -> Result<(), anyhow::Error> {
+pub async fn show(
+    pool: &crate::db::DbPool,
+    agent_name: &str,
+    json: bool,
+) -> Result<(), anyhow::Error> {
     let repo_id = resolve_cwd_repo(pool).await.ok().map(|r| r.repo_id);
     let agent_id = resolve_agent_id(pool, agent_name).await?;
     let handoff = HandoffRepo::new(pool)
@@ -85,7 +91,7 @@ pub async fn show(pool: &sqlx::PgPool, agent_name: &str, json: bool) -> Result<(
     Ok(())
 }
 
-pub async fn clear(pool: &sqlx::PgPool, agent_name: &str) -> Result<(), anyhow::Error> {
+pub async fn clear(pool: &crate::db::DbPool, agent_name: &str) -> Result<(), anyhow::Error> {
     let repo_id = resolve_cwd_repo(pool).await.ok().map(|r| r.repo_id);
     let agent_id = resolve_agent_id(pool, agent_name).await?;
     let cleared = HandoffRepo::new(pool)

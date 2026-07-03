@@ -1,5 +1,7 @@
 # Design — `ygg scheduler` daemon
 
+> **Superseded in part by the SQLite port (2026-07):** the daemon now runs on embedded SQLite — the advisory lock became an exclusive flock() on a lock file beside the DB, `FOR UPDATE SKIP LOCKED` became an atomic `ready → running` UPDATE in a `BEGIN IMMEDIATE` transaction, and LISTEN/NOTIFY became a unix-datagram socket bus (`$XDG_RUNTIME_DIR/ygg.sock`). The tick structure and stage ordering below are unchanged.
+
 > Single authoritative process that advances the task DAG. Companion to [ADR 0016](../adr/0016-autonomous-execution.md), [Orchestration runtime](../orchestration.md), and [Task-runs data model](task-runs.md).
 
 ## Scope

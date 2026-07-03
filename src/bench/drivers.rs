@@ -332,14 +332,7 @@ pub async fn invoke_claude(
     })
 }
 
-fn parse_usage(
-    stdout: &str,
-) -> (
-    Option<i64>,
-    Option<i64>,
-    Option<i64>,
-    Option<sqlx::types::BigDecimal>,
-) {
+fn parse_usage(stdout: &str) -> (Option<i64>, Option<i64>, Option<i64>, Option<f64>) {
     let parsed: Option<serde_json::Value> = serde_json::from_str(stdout).ok();
     let Some(v) = parsed else {
         return (None, None, None, None);
@@ -356,11 +349,12 @@ fn parse_usage(
     let c = usage
         .and_then(|u| u.get("cache_read_input_tokens"))
         .and_then(|n| n.as_i64());
-    let usd_s = v.get("total_cost_usd").and_then(|n| n.as_f64());
-    let usd = usd_s.and_then(|f| {
-        use std::str::FromStr;
-        sqlx::types::BigDecimal::from_str(&format!("{f:.6}")).ok()
-    });
+    // Cost is display-only; round to micro-dollar precision to match the
+    // old NUMERIC(_,6) storage.
+    let usd = v
+        .get("total_cost_usd")
+        .and_then(|n| n.as_f64())
+        .map(|f| (f * 1_000_000.0).round() / 1_000_000.0);
     (i, o, c, usd)
 }
 

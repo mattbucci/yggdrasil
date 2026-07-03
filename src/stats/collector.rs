@@ -91,13 +91,13 @@ pub fn discover_sessions(_project_path: &Path) -> Vec<PathBuf> {
     if let Ok(entries) = std::fs::read_dir(&claude_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_dir() {
-                if let Ok(files) = std::fs::read_dir(&path) {
-                    for file in files.flatten() {
-                        let fp = file.path();
-                        if fp.extension().is_some_and(|e| e == "jsonl") {
-                            sessions.push(fp);
-                        }
+            if path.is_dir()
+                && let Ok(files) = std::fs::read_dir(&path)
+            {
+                for file in files.flatten() {
+                    let fp = file.path();
+                    if fp.extension().is_some_and(|e| e == "jsonl") {
+                        sessions.push(fp);
                     }
                 }
             }

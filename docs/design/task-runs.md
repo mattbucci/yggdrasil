@@ -1,5 +1,7 @@
 # Design — `task_runs` data model
 
+> **Superseded in part by the SQLite port (2026-07):** the store is now embedded SQLite. The `SKIP LOCKED` claim query below became an atomic `ready → running` UPDATE in a `BEGIN IMMEDIATE` transaction; LISTEN/NOTIFY became a unix-datagram socket bus; the advisory lock became a file lock. Table shapes and state machine are unchanged (UUIDs stored as TEXT, timestamps as RFC 3339 TEXT, JSONB as JSON TEXT).
+
 > One row per execution attempt of a task. DBOS-shaped checkpoint model. Companion to [ADR 0016](../adr/0016-autonomous-execution.md) and [Orchestration runtime](../orchestration.md).
 
 ## Why a new table (not columns on `tasks`)

@@ -7,18 +7,19 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, PgPool};
-use uuid::Uuid;
+use sqlx::FromRow;
+
+use crate::db::DbPool;
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct Learning {
-    pub learning_id: Uuid,
-    pub repo_id: Option<Uuid>,
+    pub learning_id: String,
+    pub repo_id: Option<String>,
     pub file_glob: Option<String>,
     pub rule_id: Option<String>,
     pub text: String,
     pub context: Option<String>,
-    pub created_by: Option<Uuid>,
+    pub created_by: Option<String>,
     pub created_at: DateTime<Utc>,
     pub applied_count: i32,
     pub last_applied_at: Option<DateTime<Utc>>,
@@ -30,15 +31,15 @@ pub struct Learning {
     /// `propose`). Records how the learning entered the corpus.
     pub source: String,
     pub approved_at: Option<DateTime<Utc>>,
-    pub approved_by: Option<Uuid>,
+    pub approved_by: Option<String>,
 }
 
 pub struct LearningRepo<'a> {
-    pool: &'a PgPool,
+    pool: &'a DbPool,
 }
 
 impl<'a> LearningRepo<'a> {
-    pub fn new(pool: &'a PgPool) -> Self {
+    pub fn new(pool: &'a DbPool) -> Self {
         Self { pool }
     }
 
@@ -48,12 +49,12 @@ impl<'a> LearningRepo<'a> {
     #[allow(clippy::too_many_arguments)]
     pub async fn create(
         &self,
-        repo_id: Option<Uuid>,
+        repo_id: Option<String>,
         file_glob: Option<&str>,
         rule_id: Option<&str>,
         text: &str,
         context: Option<&str>,
-        created_by: Option<Uuid>,
+        created_by: Option<String>,
         scope_tags: &serde_json::Value,
         status: &str,
         source: &str,
@@ -88,7 +89,7 @@ impl<'a> LearningRepo<'a> {
     /// with no constraint on that dimension (key absent or null) always pass.
     pub async fn list_matching(
         &self,
-        repo_id: Option<Uuid>,
+        repo_id: Option<String>,
         file_path: Option<&str>,
         rule_id: Option<&str>,
         agent_name: Option<&str>,
@@ -101,19 +102,19 @@ impl<'a> LearningRepo<'a> {
                    status, source, approved_at, approved_by
             FROM learnings
             WHERE status = 'active'
-              AND ($1::UUID IS NULL OR repo_id IS NULL OR repo_id = $1)
-              AND ($2::TEXT IS NULL
+              AND ($1 IS NULL OR repo_id IS NULL OR repo_id = $1)
+              AND ($2 IS NULL
                    OR file_glob IS NULL
-                   OR $2 LIKE translate(file_glob, '*?', '%_'))
-              AND ($3::TEXT IS NULL OR rule_id = $3)
+                   OR $2 LIKE replace(replace(file_glob, '*', '%'), '?', '_'))
+              AND ($3 IS NULL OR rule_id = $3)
               AND (scope_tags->>'agent' IS NULL
-                   OR $4::TEXT IS NULL
+                   OR $4 IS NULL
                    OR scope_tags->>'agent' = $4)
               AND (scope_tags->>'kind' IS NULL
-                   OR $5::TEXT IS NULL
+                   OR $5 IS NULL
                    OR scope_tags->>'kind' = $5)
             ORDER BY
-              (rule_id IS NOT NULL)::int + (file_glob IS NOT NULL)::int DESC,
+              (rule_id IS NOT NULL) + (file_glob IS NOT NULL) DESC,
               created_at DESC
             "#,
         )
@@ -128,7 +129,10 @@ impl<'a> LearningRepo<'a> {
 
     /// List `pending` learnings (the triage queue), newest first. `repo_id`
     /// NULL lists across all repos; otherwise current-repo + global pending.
-    pub async fn list_pending(&self, repo_id: Option<Uuid>) -> Result<Vec<Learning>, sqlx::Error> {
+    pub async fn list_pending(
+        &self,
+        repo_id: Option<String>,
+    ) -> Result<Vec<Learning>, sqlx::Error> {
         sqlx::query_as::<_, Learning>(
             r#"
             SELECT learning_id, repo_id, file_glob, rule_id, text, context,
@@ -136,7 +140,7 @@ impl<'a> LearningRepo<'a> {
                    status, source, approved_at, approved_by
             FROM learnings
             WHERE status = 'pending'
-              AND ($1::UUID IS NULL OR repo_id IS NULL OR repo_id = $1)
+              AND ($1 IS NULL OR repo_id IS NULL OR repo_id = $1)
             ORDER BY created_at DESC
             "#,
         )
@@ -150,13 +154,13 @@ impl<'a> LearningRepo<'a> {
     /// (already active, rejected, or unknown).
     pub async fn approve(
         &self,
-        learning_id: Uuid,
-        approved_by: Option<Uuid>,
+        learning_id: String,
+        approved_by: Option<String>,
     ) -> Result<Option<Learning>, sqlx::Error> {
         sqlx::query_as::<_, Learning>(
             r#"
             UPDATE learnings
-            SET status = 'active', approved_at = now(), approved_by = $2
+            SET status = 'active', approved_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now'), approved_by = $2
             WHERE learning_id = $1 AND status = 'pending'
             RETURNING learning_id, repo_id, file_glob, rule_id, text, context,
                       created_by, created_at, applied_count, last_applied_at, scope_tags,
@@ -169,9 +173,9 @@ impl<'a> LearningRepo<'a> {
         .await
     }
 
-    pub async fn increment_applied(&self, learning_id: Uuid) -> Result<(), sqlx::Error> {
+    pub async fn increment_applied(&self, learning_id: String) -> Result<(), sqlx::Error> {
         sqlx::query(
-            "UPDATE learnings SET applied_count = applied_count + 1, last_applied_at = now() WHERE learning_id = $1",
+            "UPDATE learnings SET applied_count = applied_count + 1, last_applied_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now') WHERE learning_id = $1",
         )
         .bind(learning_id)
         .execute(self.pool)
@@ -179,7 +183,7 @@ impl<'a> LearningRepo<'a> {
         Ok(())
     }
 
-    pub async fn delete(&self, learning_id: Uuid) -> Result<(), sqlx::Error> {
+    pub async fn delete(&self, learning_id: String) -> Result<(), sqlx::Error> {
         sqlx::query("DELETE FROM learnings WHERE learning_id = $1")
             .bind(learning_id)
             .execute(self.pool)
@@ -190,7 +194,7 @@ impl<'a> LearningRepo<'a> {
     /// Reject a `pending` proposal: hard-delete it (ADR 0017 — tombstone vs
     /// delete deferred to implementation; we hard-delete). Returns true if a
     /// pending row was removed, false if none matched (active rows untouched).
-    pub async fn reject(&self, learning_id: Uuid) -> Result<bool, sqlx::Error> {
+    pub async fn reject(&self, learning_id: String) -> Result<bool, sqlx::Error> {
         let res =
             sqlx::query("DELETE FROM learnings WHERE learning_id = $1 AND status = 'pending'")
                 .bind(learning_id)

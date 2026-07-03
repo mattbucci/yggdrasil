@@ -61,10 +61,10 @@ pub fn load_from(path: &std::path::Path) -> Result<SavedViewsFile, String> {
 /// Save (overwrites) the views file at `path`. Creates parent dirs as
 /// needed; emits TOML with a stable, alphabetised key order.
 pub fn save_to(path: &std::path::Path, file: &SavedViewsFile) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {parent:?}: {e}"))?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {parent:?}: {e}"))?;
     }
     let body = toml::to_string_pretty(file).map_err(|e| format!("serialize: {e}"))?;
     std::fs::write(path, body).map_err(|e| format!("write {path:?}: {e}"))

@@ -192,12 +192,11 @@ fn find_bin(name: &str) -> Option<String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output()
+        && o.status.success()
     {
-        if o.status.success() {
-            let resolved = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if !resolved.is_empty() {
-                return Some(resolved);
-            }
+        let resolved = String::from_utf8_lossy(&o.stdout).trim().to_string();
+        if !resolved.is_empty() {
+            return Some(resolved);
         }
     }
     None
@@ -214,211 +213,6 @@ async fn run_show(cmd: &str, args: &[&str]) -> bool {
         .status()
         .await
         .is_ok_and(|s| s.success())
-}
-
-async fn port_open(port: u16) -> bool {
-    tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
-        .await
-        .is_ok()
-}
-
-async fn host_port_open(host: &str, port: u16) -> bool {
-    tokio::net::TcpStream::connect(format!("{host}:{port}"))
-        .await
-        .is_ok()
-}
-
-async fn wait_port(port: u16, secs: u64) -> bool {
-    for _ in 0..secs {
-        if port_open(port).await {
-            return true;
-        }
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
-    false
-}
-
-/// Parse (user, host, port, password) from a postgres URL.
-/// Falls back to `fallback_user` when no userinfo is present.
-fn parse_pg_url_parts(url: &str, fallback_user: &str) -> (String, String, u16, Option<String>) {
-    let rest = url
-        .strip_prefix("postgres://")
-        .or_else(|| url.strip_prefix("postgresql://"))
-        .unwrap_or(url);
-    let (userinfo, hostdb) = rest.split_once('@').unwrap_or(("", rest));
-    let (user, pass) = if userinfo.is_empty() {
-        (fallback_user.to_string(), None)
-    } else if let Some((u, p)) = userinfo.split_once(':') {
-        (u.to_string(), Some(p.to_string()))
-    } else {
-        (userinfo.to_string(), None)
-    };
-    let (hostport, _) = hostdb.split_once('/').unwrap_or((hostdb, "ygg"));
-    let (host, port) = if let Some((h, p)) = hostport.rsplit_once(':') {
-        (h.to_string(), p.parse().unwrap_or(5432))
-    } else {
-        (hostport.to_string(), 5432u16)
-    };
-    (user, host, port, pass)
-}
-
-/// Try to create the given PG role by connecting as a superuser.
-/// Attempts `postgres` first, then the system user, then the target user itself.
-async fn pg_ensure_role(
-    role: &str,
-    pass: Option<&str>,
-    host: &str,
-    port: u16,
-    sys_user: &str,
-) -> bool {
-    let port_s = port.to_string();
-    let bin = find_bin("psql").unwrap_or_else(|| "psql".to_string());
-
-    // Check if role already works
-    {
-        let mut cmd = Command::new(&bin);
-        cmd.args([
-            "-U", role, "-h", host, "-p", &port_s, "-d", "postgres", "-c", "SELECT 1", "-q",
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-        if let Some(p) = pass {
-            cmd.env("PGPASSWORD", p);
-        }
-        if cmd.status().await.is_ok_and(|s| s.success()) {
-            return true;
-        }
-    }
-
-    let esc_id = role.replace('"', "\"\"");
-    let quoted_role = format!("\"{esc_id}\"");
-    let create_sql = if let Some(p) = pass {
-        let esc_pass = p.replace('\'', "''");
-        format!(
-            "DO $$ BEGIN \
-             IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{esc_id}') THEN \
-             CREATE ROLE {quoted_role} WITH LOGIN PASSWORD '{esc_pass}' CREATEDB; \
-             END IF; \
-             END $$"
-        )
-    } else {
-        format!(
-            "DO $$ BEGIN \
-             IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{esc_id}') THEN \
-             CREATE ROLE {quoted_role} WITH LOGIN CREATEDB; \
-             END IF; \
-             END $$"
-        )
-    };
-    let grant_sql = format!("GRANT ALL ON SCHEMA public TO {quoted_role}");
-
-    // Try connecting as common superusers to create the role
-    let candidates: Vec<&str> = ["postgres", sys_user]
-        .iter()
-        .copied()
-        .filter(|u| *u != role)
-        .collect();
-
-    for su in &candidates {
-        let mut cmd = Command::new(&bin);
-        cmd.args([
-            "-U",
-            su,
-            "-h",
-            host,
-            "-p",
-            &port_s,
-            "-d",
-            "postgres",
-            "-c",
-            &create_sql,
-            "-c",
-            &grant_sql,
-            "-q",
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-        if cmd.status().await.is_ok_and(|s| s.success()) {
-            return true;
-        }
-    }
-
-    false
-}
-
-/// Run `createdb` against the configured postgres instance.
-async fn pg_createdb(user: &str, host: &str, port: u16, pass: Option<&str>) -> bool {
-    let port_s = port.to_string();
-    let bin = find_bin("createdb").unwrap_or_else(|| "createdb".to_string());
-    let mut cmd = Command::new(&bin);
-    cmd.args(["-U", user, "-h", host, "-p", &port_s, "ygg"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    if let Some(p) = pass {
-        cmd.env("PGPASSWORD", p);
-    }
-    cmd.status().await.is_ok_and(|s| s.success())
-}
-
-/// Detect which postgresql@XX version is running via brew services or pg_config.
-async fn detect_pg_version() -> String {
-    // Try pg_config first
-    if let Ok(output) = Command::new("pg_config")
-        .arg("--version")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .await
-    {
-        if output.status.success() {
-            let ver = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            // "PostgreSQL 16.4" → "postgresql@16"
-            if let Some(major) = ver
-                .split_whitespace()
-                .nth(1)
-                .and_then(|v| v.split('.').next())
-            {
-                return format!("postgresql@{major}");
-            }
-        }
-    }
-
-    // Fallback: check which brew services are running
-    if let Ok(output) = Command::new("brew")
-        .args(["services", "list"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .await
-    {
-        if output.status.success() {
-            let text = String::from_utf8_lossy(&output.stdout);
-            for line in text.lines() {
-                if line.contains("postgresql@") && line.contains("started") {
-                    if let Some(name) = line.split_whitespace().next() {
-                        return name.to_string();
-                    }
-                }
-            }
-        }
-    }
-
-    // Fallback: check common install locations
-    let prefixes = ["/opt/homebrew/opt", "/usr/local/opt", "/usr/lib/postgresql"];
-    for prefix in prefixes {
-        for ver in ["18", "17", "16", "15", "14"] {
-            let path = format!("{prefix}/postgresql@{ver}");
-            let path2 = format!("{prefix}/{ver}");
-            if Path::new(&path).exists() {
-                return format!("postgresql@{ver}");
-            }
-            if Path::new(&path2).exists() {
-                return format!("postgresql@{ver}");
-            }
-        }
-    }
-
-    "postgresql@18".to_string()
 }
 
 // ─── init ────────────────────────────────────────────────
@@ -459,11 +253,7 @@ async fn init(skips: &[String], yes: bool) -> Result<(), anyhow::Error> {
 
     // Merge CLI skips with saved skips
     let saved_skips = load_saved_skips(&config_dir).await;
-    let all_skips: Vec<String> = skips
-        .iter()
-        .cloned()
-        .chain(saved_skips.into_iter())
-        .collect();
+    let all_skips: Vec<String> = skips.iter().cloned().chain(saved_skips).collect();
 
     // Ensure we're in a valid directory — brew/apt fail if cwd is gone
     if std::env::current_dir().is_err() {
@@ -482,108 +272,32 @@ async fn init(skips: &[String], yes: bool) -> Result<(), anyhow::Error> {
         "—"
     };
 
-    // Detect system username via whoami (most reliable)
-    let sys_user = if let Ok(output) = Command::new("whoami")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .await
-    {
-        if output.status.success() {
-            String::from_utf8_lossy(&output.stdout).trim().to_string()
-        } else {
-            std::env::var("USER")
-                .or_else(|_| std::env::var("USERNAME"))
-                .unwrap_or_else(|_| "postgres".into())
-        }
-    } else {
-        std::env::var("USER")
-            .or_else(|_| std::env::var("USERNAME"))
-            .unwrap_or_else(|_| "postgres".into())
-    };
-
-    let default_db_url = format!("postgres://{sys_user}@localhost:5432/ygg");
     let env_path = config_dir.join(".env");
 
-    // Load existing config or prompt for database URL.
-    let (db_url, config_changed) = if env_path.exists() {
+    // SQLite: no connection URL to prompt for. The database lives at
+    // YGG_DB_PATH > DATABASE_URL (sqlite://...) > $XDG_DATA_HOME/ygg/ygg.db.
+    let config_changed = if env_path.exists() {
         dotenvy::from_path(&env_path).ok();
-        let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| default_db_url.clone());
-        (url, false)
+        false
     } else {
-        use std::io::{self, BufRead, Write};
-        println!("  {BR}│{X}  {B}PostgreSQL connection{X}");
-        println!("  {BR}│{X}  {D}default uses system user '{sys_user}', no password{X}");
-        println!("  {BR}│{X}  {D}default: {default_db_url}{X}");
-        println!("  {BR}│{X}");
-        println!("  {BR}│{X}  {Y}use default? [Y/n]{X}");
-        // --yes: take the default URL without prompting.
-        let a = if non_interactive() {
-            println!("  {BR}│{X}  {D}> (--yes) default{X}");
-            String::new()
-        } else {
-            print!("  {BR}│{X}  > ");
-            io::stdout().flush().ok();
-            let mut answer = String::new();
-            io::stdin().lock().read_line(&mut answer).ok();
-            answer.trim().to_lowercase()
-        };
-
-        let url = if a.is_empty() || a == "y" || a == "yes" {
-            default_db_url.clone()
-        } else {
-            println!(
-                "  {BR}│{X}  {D}enter postgres URL (e.g. postgres://user:pass@host:5432/ygg){X}"
-            );
-            print!("  {BR}│{X}  > ");
-            io::stdout().flush().ok();
-            let mut custom = String::new();
-            io::stdin().lock().read_line(&mut custom).ok();
-            let custom = custom.trim().to_string();
-            if custom.is_empty() {
-                default_db_url.clone()
-            } else {
-                custom
-            }
-        };
-
-        // Write config immediately so it's saved
-        let env_content = format!(
-            "DATABASE_URL={url}\n\
+        let env_content = "# Database location (optional). Default: $XDG_DATA_HOME/ygg/ygg.db\n\
+             # YGG_DB_PATH=/path/to/ygg.db\n\
              CONTEXT_LIMIT_TOKENS=250000\n\
              CONTEXT_HARD_CAP_TOKENS=300000\n\
              LOCK_TTL_SECS=300\n\
              HEARTBEAT_INTERVAL_SECS=60\n\
              WATCHER_INTERVAL_SECS=30\n\
              RTK_BINARY_PATH=rtk\n\
-             RUST_LOG=ygg=info\n"
-        );
-        let _ = tokio::fs::write(&env_path, &env_content).await;
-
-        (url, true)
+             RUST_LOG=ygg=info\n";
+        let _ = tokio::fs::write(&env_path, env_content).await;
+        true
     };
 
-    // Always force the correct DATABASE_URL in env
-    unsafe {
-        std::env::set_var("DATABASE_URL", &db_url);
-    }
-
-    // Parse pg connection details — used for all createdb/psql calls so we
-    // connect to the right host/port/user regardless of where postgres lives.
-    let (pg_user, pg_host, pg_port, pg_pass) = parse_pg_url_parts(&db_url, &sys_user);
-    let pg_is_local = pg_host == "localhost" || pg_host == "127.0.0.1";
-
-    let db_show = db_url
-        .find('@')
-        .and_then(|at| {
-            db_url[..at]
-                .rfind(':')
-                .map(|c| format!("{}:***@{}", &db_url[..c], &db_url[at + 1..]))
-        })
-        .unwrap_or_else(|| db_url.clone());
+    let db_url = db::resolve_database_url();
+    let db_show = db_url.clone();
 
     println!("  {D}pkg{X}     {pkg}");
-    println!("  {D}pg{X}      {db_show}");
+    println!("  {D}db{X}      {db_show}");
     println!();
     println!("  {BR}╭─────────────────────────────────────────────╮{X}");
 
@@ -655,84 +369,35 @@ async fn init(skips: &[String], yes: bool) -> Result<(), anyhow::Error> {
         ok("rtk", "found");
     }
 
-    // ── pg ──
-    head("postgresql");
+    // ── database (SQLite) ──
+    head("database");
 
-    if skipping(&all_skips, "pg") {
-        ok("postgresql", "skipped");
-    } else if host_port_open(&pg_host, pg_port).await {
-        ok("postgresql", "running");
-    } else if pg_is_local {
-        // Local postgres not responding — try to start or install it
-        if has("psql").await {
-            ok("postgresql", "installed");
-            let pg_ver = detect_pg_version().await;
-            if has_brew {
-                run_show("brew", &["services", "start", &pg_ver]).await;
+    if skipping(&all_skips, "migrations") {
+        ok("migrations", "skipped");
+    } else {
+        let pb = spin("opening database + running migrations...");
+        match async {
+            let pool = db::create_pool(&db_url).await?;
+            db::run_migrations(&pool).await?;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await
+        {
+            Result::Ok(()) => {
+                pb.finish_and_clear();
+                ok("database", &db_url);
+                ok("migrations", "applied");
             }
-            if wait_port(5432, 10).await {
-                ok("postgresql", "started");
-            } else {
-                bad("postgresql", "not responding on :5432");
-                if has_brew {
-                    hint(&format!("try: brew services restart {pg_ver}"));
-                }
-                if !prompt_skip("postgresql") {
+            Err(e) => {
+                pb.finish_and_clear();
+                bad("migrations", "failed");
+                hint(&format!("{e}"));
+                hint("check that the database path is writable");
+                if !prompt_skip("migrations") {
                     std::process::exit(1);
                 }
+                hint("to retry later: ygg migrate");
             }
-        } else {
-            bad("postgresql", "not installed");
-            if has_brew {
-                hint("run: brew install postgresql@18");
-                hint("then: brew services start postgresql@18");
-            } else if has_apt {
-                hint("run: sudo apt-get install -y postgresql postgresql-client");
-                hint("then: sudo systemctl start postgresql");
-            } else {
-                hint("install: https://www.postgresql.org/download/");
-            }
-            if !prompt_skip("postgresql") {
-                std::process::exit(1);
-            }
-        }
-    } else {
-        // Remote postgres not reachable
-        bad("postgresql", &format!("cannot reach {pg_host}:{pg_port}"));
-        hint("check that your port-forward or remote host is accessible");
-        if !prompt_skip("postgresql") {
-            std::process::exit(1);
-        }
-    }
-
-    // database + pgvector (only if pg is up)
-    if !skipping(&all_skips, "pg") && host_port_open(&pg_host, pg_port).await {
-        // Ensure the configured role exists
-        if pg_ensure_role(&pg_user, pg_pass.as_deref(), &pg_host, pg_port, &sys_user).await {
-            ok(&format!("role '{pg_user}'"), "ready");
-        } else {
-            bad(&format!("role '{pg_user}'"), "cannot create");
-            hint(&format!(
-                "run: psql -U postgres -h {pg_host} -p {pg_port} -d postgres -c \"CREATE ROLE {pg_user} WITH LOGIN CREATEDB;\""
-            ));
-            hint(&format!(
-                "then: psql -U postgres -h {pg_host} -p {pg_port} -d postgres -c \"GRANT ALL ON SCHEMA public TO {pg_user};\""
-            ));
-            hint("then re-run: ygg init");
-            // Same skip-or-exit contract as the other postgres failure paths
-            // above — without this, --yes (and a plain skip) couldn't get past
-            // an existing-but-unmanageable role (e.g. Postgres.app, where the
-            // superuser is the OS user, not `postgres`).
-            if !prompt_skip("postgresql") {
-                std::process::exit(1);
-            }
-        }
-
-        // Create database
-        if pg_createdb(&pg_user, &pg_host, pg_port, pg_pass.as_deref()).await {
-            ok("database 'ygg'", "created");
-        } else {
-            ok("database 'ygg'", "exists");
         }
     }
 
@@ -743,145 +408,6 @@ async fn init(skips: &[String], yes: bool) -> Result<(), anyhow::Error> {
         ok(&format!("{}", env_path.display()), "created");
     } else {
         ok(&format!("{}", env_path.display()), "exists");
-    }
-
-    if !skipping(&all_skips, "pg") && host_port_open(&pg_host, pg_port).await {
-        // Ensure database exists
-        pg_createdb(&pg_user, &pg_host, pg_port, pg_pass.as_deref()).await;
-
-        // Pre-flight psql connection check before attempting migrations
-        let probe_ok = if skipping(&all_skips, "migrations") {
-            true
-        } else {
-            let port_s = pg_port.to_string();
-            let bin = find_bin("psql").unwrap_or_else(|| "psql".to_string());
-            let mut cmd = Command::new(&bin);
-            cmd.args([
-                "-U", &pg_user, "-h", &pg_host, "-p", &port_s, "-d", "ygg", "-c", "SELECT 1", "-q",
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped());
-            if let Some(ref p) = pg_pass {
-                cmd.env("PGPASSWORD", p);
-            }
-            match cmd.output().await {
-                Ok(output) if output.status.success() => true,
-                Ok(output) => {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    let stderr = stderr.trim();
-                    bad("connection", "psql probe failed");
-                    if !stderr.is_empty() {
-                        hint(&format!("psql: {stderr}"));
-                    }
-                    if stderr.contains("role") && stderr.contains("does not exist") {
-                        hint(&format!("configured URL: {db_show}"));
-                        hint("create the role or update DATABASE_URL in .env");
-                    } else if stderr.contains("password authentication failed") {
-                        hint("check the password in DATABASE_URL");
-                    } else if stderr.contains("Connection refused") {
-                        hint("postgres appears down or not listening on the configured port");
-                    } else if stderr.contains("TimeZone") {
-                        hint("postgres cannot resolve timezone data — reinstall or check config");
-                    }
-                    false
-                }
-                Err(e) => {
-                    bad("connection", "psql probe failed");
-                    hint(&format!("could not run psql: {e}"));
-                    false
-                }
-            }
-        };
-
-        if !probe_ok {
-            if prompt_skip("migrations") {
-                // skip migrations entirely
-            } else {
-                std::process::exit(1);
-            }
-        }
-
-        if probe_ok && !skipping(&all_skips, "migrations") {
-            let pb = spin("running migrations...");
-            match async {
-                let pool = db::create_pool(&db_url).await?;
-                db::run_migrations(&pool).await?;
-                Ok::<(), anyhow::Error>(())
-            }
-            .await
-            {
-                Result::Ok(()) => {
-                    pb.finish_and_clear();
-                    ok("migrations", "applied");
-                }
-                Err(e) => {
-                    pb.finish_and_clear();
-                    let err_str = format!("{e}");
-                    bad("migrations", "failed");
-
-                    if err_str.contains("TimeZone") {
-                        hint("PostgreSQL cannot resolve timezone data");
-                        hint("this is common with brew postgresql@17/18 installs");
-                        hint("");
-                        if has_brew {
-                            let pg_ver = detect_pg_version().await;
-                            hint(&format!("try: brew reinstall {pg_ver}"));
-                            hint(&format!("then: brew services restart {pg_ver}"));
-                        } else {
-                            hint("ensure timezone data is installed (postgresql-common on apt)");
-                            hint("check: psql -c \"SHOW timezone\"");
-                        }
-                    } else if err_str.contains("role") && err_str.contains("does not exist") {
-                        hint("the configured role doesn't exist on this postgres server");
-                        hint(&format!("current URL: {db_show}"));
-                        hint("");
-                        // Offer to reconfigure the URL in-place. Skipped under
-                        // --yes — there's no new URL to read unattended, so just
-                        // print the manual-fix hints below.
-                        if !non_interactive() && prompt_yes("reconfigure the database URL now?") {
-                            use std::io::{self, BufRead, Write};
-                            hint(&format!("your system user is: {sys_user}"));
-                            println!(
-                                "  {BR}│{X}  {D}enter postgres URL (e.g. postgres://user:pass@host:port/ygg){X}"
-                            );
-                            print!("  {BR}│{X}  > ");
-                            io::stdout().flush().ok();
-                            let mut new_url = String::new();
-                            io::stdin().lock().read_line(&mut new_url).ok();
-                            let new_url = new_url.trim().to_string();
-                            if !new_url.is_empty() {
-                                let new_content = format!(
-                                    "DATABASE_URL={new_url}\n\
-                                 CONTEXT_LIMIT_TOKENS=250000\n\
-                                 CONTEXT_HARD_CAP_TOKENS=300000\n\
-                                 LOCK_TTL_SECS=300\n\
-                                 HEARTBEAT_INTERVAL_SECS=60\n\
-                                 WATCHER_INTERVAL_SECS=30\n\
-                                 RTK_BINARY_PATH=rtk\n\
-                                 RUST_LOG=ygg=info\n"
-                                );
-                                if tokio::fs::write(&env_path, &new_content).await.is_ok() {
-                                    ok("config", "updated — re-run: ygg init");
-                                }
-                            }
-                        } else {
-                            hint(&format!("  rm {}", env_path.display()));
-                            hint("  ygg init");
-                        }
-                    } else if err_str.contains("does not exist") && err_str.contains("database") {
-                        hint("database 'ygg' doesn't exist");
-                        hint(&format!("  createdb -U {sys_user} ygg"));
-                    } else {
-                        hint(&format!("{e}"));
-                    }
-
-                    if !prompt_skip("migrations") {
-                        std::process::exit(1);
-                    }
-                    hint("to retry later: ygg migrate");
-                }
-            }
-        } // if probe_ok
     }
 
     // ── hooks + status bar ──
@@ -1010,23 +536,23 @@ async fn init(skips: &[String], yes: bool) -> Result<(), anyhow::Error> {
     }
 
     // ── project integration ──
-    if !skipping(&all_skips, "project") {
-        if let Ok(cwd) = std::env::current_dir() {
-            head("project integration");
-            if super::init_project::has_any_content(&cwd) {
-                hint("CLAUDE.md or AGENTS.md already has content — skipping auto-install");
-                hint("run `ygg integrate` to install the managed block, `--remove` to strip it");
-            } else {
-                match super::init_project::install(&cwd) {
-                    Ok(report) => {
-                        for (path, action) in &report.files {
-                            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
-                            ok(name, &action.to_string());
-                        }
+    if !skipping(&all_skips, "project")
+        && let Ok(cwd) = std::env::current_dir()
+    {
+        head("project integration");
+        if super::init_project::has_any_content(&cwd) {
+            hint("CLAUDE.md or AGENTS.md already has content — skipping auto-install");
+            hint("run `ygg integrate` to install the managed block, `--remove` to strip it");
+        } else {
+            match super::init_project::install(&cwd) {
+                Ok(report) => {
+                    for (path, action) in &report.files {
+                        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+                        ok(name, &action.to_string());
                     }
-                    Err(e) => {
-                        bad("project integration", &format!("{e}"));
-                    }
+                }
+                Err(e) => {
+                    bad("project integration", &format!("{e}"));
                 }
             }
         }
@@ -1089,69 +615,5 @@ mod tests {
             content.contains("ygg run capture-outcome"),
             "stop.sh must invoke `ygg run capture-outcome` (see yggdrasil-97)"
         );
-    }
-
-    use super::parse_pg_url_parts;
-
-    #[test]
-    fn parse_full_url_with_user_pass_host_port() {
-        let (user, host, port, pass) = parse_pg_url_parts(
-            "postgres://alice:s3cret@db.example.com:5433/ygg",
-            "fallback",
-        );
-        assert_eq!(user, "alice");
-        assert_eq!(host, "db.example.com");
-        assert_eq!(port, 5433);
-        assert_eq!(pass, Some("s3cret".to_string()));
-    }
-
-    #[test]
-    fn parse_user_without_password() {
-        let (user, host, port, pass) =
-            parse_pg_url_parts("postgres://bob@localhost:5432/ygg", "fallback");
-        assert_eq!(user, "bob");
-        assert_eq!(host, "localhost");
-        assert_eq!(port, 5432);
-        assert_eq!(pass, None);
-    }
-
-    #[test]
-    fn parse_no_userinfo_uses_fallback() {
-        let (user, host, port, pass) =
-            parse_pg_url_parts("postgres://localhost:5432/ygg", "sysuser");
-        assert_eq!(user, "sysuser");
-        assert_eq!(host, "localhost");
-        assert_eq!(port, 5432);
-        assert_eq!(pass, None);
-    }
-
-    #[test]
-    fn parse_postgresql_prefix() {
-        let (user, host, port, pass) =
-            parse_pg_url_parts("postgresql://admin:pw@pghost:5555/mydb", "fallback");
-        assert_eq!(user, "admin");
-        assert_eq!(host, "pghost");
-        assert_eq!(port, 5555);
-        assert_eq!(pass, Some("pw".to_string()));
-    }
-
-    #[test]
-    fn parse_default_port_when_omitted() {
-        let (user, host, port, pass) =
-            parse_pg_url_parts("postgres://alice@myhost/ygg", "fallback");
-        assert_eq!(user, "alice");
-        assert_eq!(host, "myhost");
-        assert_eq!(port, 5432);
-        assert_eq!(pass, None);
-    }
-
-    #[test]
-    fn parse_non_standard_port() {
-        let (user, host, port, pass) =
-            parse_pg_url_parts("postgres://dev:devpass@127.0.0.1:15432/ygg", "fallback");
-        assert_eq!(user, "dev");
-        assert_eq!(host, "127.0.0.1");
-        assert_eq!(port, 15432);
-        assert_eq!(pass, Some("devpass".to_string()));
     }
 }

@@ -68,7 +68,7 @@ pub fn pulse_style(base: Style, frames_remaining: u8) -> Style {
     if frames_remaining == 0 {
         return base;
     }
-    if frames_remaining >= PULSE_FRAMES / 2 + 1 {
+    if frames_remaining > PULSE_FRAMES / 2 {
         base.add_modifier(Modifier::BOLD)
     } else {
         base.add_modifier(Modifier::DIM)

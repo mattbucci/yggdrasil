@@ -2,24 +2,29 @@
 //! only shows a summary count; this view shows holder, age, TTL, and
 //! whether the holder is still alive. Enter releases the selected lock.
 
+use crate::db::DbPool;
 use chrono::Utc;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
-use sqlx::PgPool;
 use std::collections::HashMap;
-use uuid::Uuid;
 
 use crate::lock::{LockManager, ResourceLock};
 use crate::models::agent::AgentRepo;
 
 pub struct LocksView {
     pub locks: Vec<ResourceLock>,
-    pub agent_name_by_id: HashMap<Uuid, String>,
+    pub agent_name_by_id: HashMap<String, String>,
     /// Agent-ids whose most-recent activity was within the alive window.
     /// Drives the alive/stale column without a separate roundtrip.
-    pub alive_ids: std::collections::HashSet<Uuid>,
+    pub alive_ids: std::collections::HashSet<String>,
     pub selected: usize,
     pub flash: Option<String>,
+}
+
+impl Default for LocksView {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl LocksView {
@@ -33,7 +38,7 @@ impl LocksView {
         }
     }
 
-    pub async fn refresh(&mut self, pool: &PgPool, ttl_secs: u64) -> Result<(), anyhow::Error> {
+    pub async fn refresh(&mut self, pool: &DbPool, ttl_secs: u64) -> Result<(), anyhow::Error> {
         let lock_mgr = LockManager::new(pool, ttl_secs, crate::db::user_id());
         let mut locks = lock_mgr.list_all().await?;
         let now = Utc::now();
@@ -47,13 +52,13 @@ impl LocksView {
         let agents = agent_repo.list_all().await?;
         self.agent_name_by_id = agents
             .iter()
-            .map(|a| (a.agent_id, a.agent_name.clone()))
+            .map(|a| (a.agent_id.clone(), a.agent_name.clone()))
             .collect();
         let cutoff = now - chrono::Duration::minutes(10);
         self.alive_ids = agents
             .iter()
             .filter(|a| a.updated_at >= cutoff)
-            .map(|a| a.agent_id)
+            .map(|a| a.agent_id.clone())
             .collect();
 
         if self.selected >= self.locks.len() && !self.locks.is_empty() {
@@ -73,12 +78,12 @@ impl LocksView {
 
     /// Release the selected lock. Returns the flash message the caller
     /// should display. Also triggers a refresh so the row disappears.
-    pub async fn release_selected(&mut self, pool: &PgPool, ttl_secs: u64) {
+    pub async fn release_selected(&mut self, pool: &DbPool, ttl_secs: u64) {
         let Some(lock) = self.locks.get(self.selected).cloned() else {
             return;
         };
         let lock_mgr = LockManager::new(pool, ttl_secs, crate::db::user_id());
-        match lock_mgr.release(&lock.resource_key, lock.agent_id).await {
+        match lock_mgr.release(&lock.resource_key, &lock.agent_id).await {
             Ok(()) => self.flash = Some(format!("released {}", short_resource(&lock.resource_key))),
             Err(e) => self.flash = Some(format!("release failed: {e}")),
         }

@@ -8,8 +8,9 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, PgPool};
-use uuid::Uuid;
+use sqlx::FromRow;
+
+use crate::db::DbPool;
 
 pub mod drivers;
 pub mod manifest;
@@ -88,7 +89,7 @@ impl std::str::FromStr for Tier {
 
 #[derive(Debug, Clone, Serialize, FromRow)]
 pub struct BenchRun {
-    pub run_id: Uuid,
+    pub run_id: String,
     pub scenario: String,
     pub baseline: String,
     pub parallelism: i32,
@@ -103,23 +104,23 @@ pub struct BenchRun {
 
 #[derive(Debug, Clone, FromRow)]
 pub struct BenchTaskResult {
-    pub run_id: Uuid,
+    pub run_id: String,
     pub task_idx: i32,
     pub passed: bool,
     pub wall_clock_s: i32,
     pub tokens_in: Option<i64>,
     pub tokens_out: Option<i64>,
     pub tokens_cache: Option<i64>,
-    pub usd: Option<sqlx::types::BigDecimal>,
+    pub usd: Option<f64>,
     pub reopened: bool,
 }
 
 pub struct BenchRepo<'a> {
-    pool: &'a PgPool,
+    pool: &'a DbPool,
 }
 
 impl<'a> BenchRepo<'a> {
-    pub fn new(pool: &'a PgPool) -> Self {
+    pub fn new(pool: &'a DbPool) -> Self {
         Self { pool }
     }
 
@@ -148,12 +149,12 @@ impl<'a> BenchRepo<'a> {
 
     pub async fn finalize(
         &self,
-        run_id: Uuid,
+        run_id: &str,
         passed: bool,
         notes: Option<&str>,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
-            "UPDATE bench_runs SET ended_at = now(), passed = $2, notes = $3 WHERE run_id = $1",
+            "UPDATE bench_runs SET ended_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now'), passed = $2, notes = $3 WHERE run_id = $1",
         )
         .bind(run_id)
         .bind(passed)
@@ -163,7 +164,7 @@ impl<'a> BenchRepo<'a> {
         Ok(())
     }
 
-    pub async fn get_run(&self, run_id: Uuid) -> Result<Option<BenchRun>, sqlx::Error> {
+    pub async fn get_run(&self, run_id: &str) -> Result<Option<BenchRun>, sqlx::Error> {
         sqlx::query_as::<_, BenchRun>("SELECT * FROM bench_runs WHERE run_id = $1")
             .bind(run_id)
             .fetch_optional(self.pool)
@@ -195,7 +196,7 @@ impl<'a> BenchRepo<'a> {
 
     pub async fn write_task_result(
         &self,
-        run_id: Uuid,
+        run_id: &str,
         result: &BenchTaskResult,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
@@ -210,7 +211,7 @@ impl<'a> BenchRepo<'a> {
         .bind(result.tokens_in)
         .bind(result.tokens_out)
         .bind(result.tokens_cache)
-        .bind(&result.usd)
+        .bind(result.usd)
         .bind(result.reopened)
         .execute(self.pool)
         .await?;
@@ -219,7 +220,7 @@ impl<'a> BenchRepo<'a> {
 
     pub async fn list_task_results(
         &self,
-        run_id: Uuid,
+        run_id: &str,
     ) -> Result<Vec<BenchTaskResult>, sqlx::Error> {
         sqlx::query_as::<_, BenchTaskResult>(
             "SELECT * FROM bench_task_results WHERE run_id = $1 ORDER BY task_idx",
@@ -231,7 +232,7 @@ impl<'a> BenchRepo<'a> {
 
     pub async fn write_metric(
         &self,
-        run_id: Uuid,
+        run_id: &str,
         metric: &str,
         value: f64,
     ) -> Result<(), sqlx::Error> {

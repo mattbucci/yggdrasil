@@ -1,7 +1,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, PgPool};
-use uuid::Uuid;
+use sqlx::FromRow;
+
+use crate::db::DbPool;
 
 #[derive(Debug, Clone, PartialEq, sqlx::Type, Serialize, Deserialize)]
 #[sqlx(type_name = "event_kind", rename_all = "snake_case")]
@@ -45,9 +46,9 @@ impl EventKind {
 
 #[derive(Debug, Clone, Serialize, FromRow)]
 pub struct Event {
-    pub id: Uuid,
+    pub id: String,
     pub event_kind: EventKind,
-    pub agent_id: Option<Uuid>,
+    pub agent_id: Option<String>,
     pub agent_name: String,
     pub payload: serde_json::Value,
     pub created_at: DateTime<Utc>,
@@ -81,11 +82,11 @@ pub fn cc_session_id() -> Option<String> {
 }
 
 pub struct EventRepo<'a> {
-    pool: &'a PgPool,
+    pool: &'a DbPool,
 }
 
 impl<'a> EventRepo<'a> {
-    pub fn new(pool: &'a PgPool) -> Self {
+    pub fn new(pool: &'a DbPool) -> Self {
         Self { pool }
     }
 
@@ -93,7 +94,7 @@ impl<'a> EventRepo<'a> {
         &self,
         kind: EventKind,
         agent_name: &str,
-        agent_id: Option<Uuid>,
+        agent_id: Option<String>,
         payload: serde_json::Value,
     ) -> Result<(), sqlx::Error> {
         // Auto-tag with the ambient CC session id when the hook path set it.
@@ -110,6 +111,8 @@ impl<'a> EventRepo<'a> {
         .bind(cc_session_id)
         .execute(self.pool)
         .await?;
+        // Wake the scheduler (if one is listening) — fire-and-forget.
+        crate::bus::notify("events", kind.label());
         Ok(())
     }
 

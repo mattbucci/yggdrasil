@@ -1,15 +1,12 @@
 //! Regression tests for `ygg task move` — reassign a task to another repo,
 //! renumbering its per-repo seq while keeping the task_id stable.
 //!
-//! Requires Postgres + migrations applied:
-//!     DATABASE_URL=postgres://ng@localhost:5432/ygg cargo test --test task_move -- --test-threads=1
 
-use std::env;
-use uuid::Uuid;
+mod common;
 use ygg::models::repo::RepoRepo;
 use ygg::models::task::{TaskCreate, TaskKind, TaskRepo};
 
-async fn make_repo(pool: &sqlx::PgPool, prefix: &str) -> Uuid {
+async fn make_repo(pool: &ygg::db::DbPool, prefix: &str) -> String {
     RepoRepo::new(pool)
         .register(None, prefix, prefix, Some(&format!("/tmp/{prefix}")))
         .await
@@ -17,7 +14,7 @@ async fn make_repo(pool: &sqlx::PgPool, prefix: &str) -> Uuid {
         .repo_id
 }
 
-async fn teardown(pool: &sqlx::PgPool, repo_ids: &[Uuid]) {
+async fn teardown(pool: &ygg::db::DbPool, repo_ids: &[String]) {
     for id in repo_ids {
         sqlx::query("DELETE FROM repos WHERE repo_id = $1")
             .bind(id)
@@ -29,8 +26,7 @@ async fn teardown(pool: &sqlx::PgPool, repo_ids: &[Uuid]) {
 
 #[tokio::test]
 async fn move_reassigns_repo_and_renumbers_seq() {
-    let db_url = env::var("DATABASE_URL").expect("DATABASE_URL required");
-    let pool = ygg::db::create_pool(&db_url).await.unwrap();
+    let pool = common::test_db().await;
     let src = make_repo(&pool, "movesrc").await;
     let dst = make_repo(&pool, "movedst").await;
     let repo = TaskRepo::new(&pool);
@@ -38,7 +34,7 @@ async fn move_reassigns_repo_and_renumbers_seq() {
     let labels: [String; 0] = [];
     let task = repo
         .create(
-            src,
+            &src,
             None,
             TaskCreate {
                 title: "filed in wrong repo",
@@ -53,10 +49,10 @@ async fn move_reassigns_repo_and_renumbers_seq() {
         .unwrap();
     let task_id = task.task_id;
 
-    let new_seq = repo.move_to_repo(task_id, dst, None).await.unwrap();
+    let new_seq = repo.move_to_repo(&task_id, &dst, None).await.unwrap();
 
     // task_id is stable; repo_id + seq follow the destination.
-    let moved = repo.get(task_id).await.unwrap().unwrap();
+    let moved = repo.get(&task_id).await.unwrap().unwrap();
     assert_eq!(
         moved.task_id, task_id,
         "task_id must be stable across a move"
@@ -65,12 +61,12 @@ async fn move_reassigns_repo_and_renumbers_seq() {
     assert_eq!(moved.seq, new_seq, "row seq must match the allocated seq");
 
     // The new human ref resolves in the destination repo.
-    let by_ref = repo.get_by_ref(dst, new_seq).await.unwrap().unwrap();
+    let by_ref = repo.get_by_ref(&dst, new_seq).await.unwrap().unwrap();
     assert_eq!(by_ref.task_id, task_id);
 
     // It no longer resolves under its old (repo, seq).
     assert!(
-        repo.get_by_ref(src, task.seq).await.unwrap().is_none(),
+        repo.get_by_ref(&src, task.seq).await.unwrap().is_none(),
         "old ref must stop resolving in the source repo"
     );
 
@@ -79,8 +75,7 @@ async fn move_reassigns_repo_and_renumbers_seq() {
 
 #[tokio::test]
 async fn move_records_a_moved_event() {
-    let db_url = env::var("DATABASE_URL").expect("DATABASE_URL required");
-    let pool = ygg::db::create_pool(&db_url).await.unwrap();
+    let pool = common::test_db().await;
     let src = make_repo(&pool, "moveevsrc").await;
     let dst = make_repo(&pool, "moveevdst").await;
     let repo = TaskRepo::new(&pool);
@@ -88,7 +83,7 @@ async fn move_records_a_moved_event() {
     let labels: [String; 0] = [];
     let task = repo
         .create(
-            src,
+            &src,
             None,
             TaskCreate {
                 title: "event check",
@@ -102,13 +97,13 @@ async fn move_records_a_moved_event() {
         .await
         .unwrap();
 
-    repo.move_to_repo(task.task_id, dst, None).await.unwrap();
+    repo.move_to_repo(&task.task_id, &dst, None).await.unwrap();
 
     let moved_events: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM task_events WHERE task_id = $1 AND kind = 'moved'",
     )
     .bind(task.task_id)
-    .fetch_one(&pool)
+    .fetch_one(&*pool)
     .await
     .unwrap();
     assert_eq!(moved_events, 1, "a single 'moved' event must be recorded");

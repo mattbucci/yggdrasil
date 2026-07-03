@@ -179,11 +179,11 @@ impl BlobStore {
                         inner_name.to_string_lossy(),
                         name_str
                     );
-                    if let Ok(bref) = BlobRef::parse(&full) {
-                        if !keep.contains(&bref) {
-                            fs::remove_file(blob.path())?;
-                            removed += 1;
-                        }
+                    if let Ok(bref) = BlobRef::parse(&full)
+                        && !keep.contains(&bref)
+                    {
+                        fs::remove_file(blob.path())?;
+                        removed += 1;
                     }
                 }
                 // Try removing now-empty subdir; ignore not-empty errors.

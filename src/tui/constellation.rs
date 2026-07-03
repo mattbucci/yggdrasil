@@ -13,11 +13,10 @@
 //! The braille-canvas renderer + per-tick relax loop layer on top.
 
 use std::collections::HashMap;
-use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AgentNode {
-    pub agent_id: Uuid,
+    pub agent_id: String,
     pub label: String,
     /// Position in the layout's [0.0, 1.0] × [0.0, 1.0] unit square.
     /// Fed into a Rect mapping at render time.
@@ -31,8 +30,8 @@ pub struct AgentNode {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AgentEdge {
-    pub from: Uuid,
-    pub to: Uuid,
+    pub from: String,
+    pub to: String,
     /// Edge weight — shared-resource intensity. The renderer scales
     /// thickness by it so heavy contention reads visually.
     pub weight: f32,
@@ -53,7 +52,10 @@ pub fn relax(nodes: &mut [AgentNode], edges: &[AgentEdge], cooling: f32) {
     let k_sq = k * k;
 
     // Repulsive force between every pair.
-    let snapshot: Vec<(Uuid, f32, f32)> = nodes.iter().map(|a| (a.agent_id, a.x, a.y)).collect();
+    let snapshot: Vec<(String, f32, f32)> = nodes
+        .iter()
+        .map(|a| (a.agent_id.clone(), a.x, a.y))
+        .collect();
     for a in nodes.iter_mut() {
         let (mut fx, mut fy) = (0.0_f32, 0.0_f32);
         for (oid, ox, oy) in &snapshot {
@@ -72,9 +74,11 @@ pub fn relax(nodes: &mut [AgentNode], edges: &[AgentEdge], cooling: f32) {
     }
 
     // Attractive force along each edge.
-    let lookup: HashMap<Uuid, (f32, f32)> =
-        nodes.iter().map(|a| (a.agent_id, (a.x, a.y))).collect();
-    let mut deltas: HashMap<Uuid, (f32, f32)> = HashMap::new();
+    let lookup: HashMap<String, (f32, f32)> = nodes
+        .iter()
+        .map(|a| (a.agent_id.clone(), (a.x, a.y)))
+        .collect();
+    let mut deltas: HashMap<String, (f32, f32)> = HashMap::new();
     for e in edges {
         let Some(&(ax, ay)) = lookup.get(&e.from) else {
             continue;
@@ -88,10 +92,10 @@ pub fn relax(nodes: &mut [AgentNode], edges: &[AgentEdge], cooling: f32) {
         let force = (dist * dist) / k * e.weight;
         let fx = dx * force / dist;
         let fy = dy * force / dist;
-        deltas.entry(e.from).or_insert((0.0, 0.0)).0 -= fx;
-        deltas.entry(e.from).or_insert((0.0, 0.0)).1 -= fy;
-        deltas.entry(e.to).or_insert((0.0, 0.0)).0 += fx;
-        deltas.entry(e.to).or_insert((0.0, 0.0)).1 += fy;
+        deltas.entry(e.from.clone()).or_insert((0.0, 0.0)).0 -= fx;
+        deltas.entry(e.from.clone()).or_insert((0.0, 0.0)).1 -= fy;
+        deltas.entry(e.to.clone()).or_insert((0.0, 0.0)).0 += fx;
+        deltas.entry(e.to.clone()).or_insert((0.0, 0.0)).1 += fy;
     }
     for a in nodes.iter_mut() {
         if let Some(&(dx, dy)) = deltas.get(&a.agent_id) {
@@ -106,29 +110,33 @@ pub fn relax(nodes: &mut [AgentNode], edges: &[AgentEdge], cooling: f32) {
 
 /// Identify connected components — useful for the renderer to colour
 /// each cluster distinctly. Returns a parent vector keyed by agent_id.
-pub fn cluster_of(nodes: &[AgentNode], edges: &[AgentEdge]) -> HashMap<Uuid, Uuid> {
+pub fn cluster_of(nodes: &[AgentNode], edges: &[AgentEdge]) -> HashMap<String, String> {
     // Union-find over agent_ids.
-    let mut parent: HashMap<Uuid, Uuid> = nodes.iter().map(|n| (n.agent_id, n.agent_id)).collect();
-    fn find(parent: &mut HashMap<Uuid, Uuid>, x: Uuid) -> Uuid {
+    let mut parent: HashMap<String, String> = nodes
+        .iter()
+        .map(|n| (n.agent_id.clone(), n.agent_id.clone()))
+        .collect();
+    fn find(parent: &mut HashMap<String, String>, x: String) -> String {
         let mut cur = x;
         while parent[&cur] != cur {
-            let next = parent[&cur];
-            parent.insert(cur, parent[&next]); // path compression
-            cur = parent[&cur];
+            let next = parent[&cur].clone();
+            let grand = parent[&next].clone();
+            parent.insert(cur.clone(), grand); // path compression
+            cur = parent[&cur].clone();
         }
         cur
     }
     for e in edges {
-        let ra = find(&mut parent, e.from);
-        let rb = find(&mut parent, e.to);
+        let ra = find(&mut parent, e.from.clone());
+        let rb = find(&mut parent, e.to.clone());
         if ra != rb {
             parent.insert(ra, rb);
         }
     }
     // Final pass to flatten roots.
-    let keys: Vec<Uuid> = parent.keys().copied().collect();
+    let keys: Vec<String> = parent.keys().cloned().collect();
     for k in keys {
-        let root = find(&mut parent, k);
+        let root = find(&mut parent, k.clone());
         parent.insert(k, root);
     }
     parent

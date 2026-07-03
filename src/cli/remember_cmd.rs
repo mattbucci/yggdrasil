@@ -6,9 +6,8 @@
 use crate::cli::task_cmd::resolve_cwd_repo;
 use crate::models::memory::MemoryRepo;
 use crate::models::repo::RepoRepo;
-use uuid::Uuid;
 
-async fn resolve_agent_id(pool: &sqlx::PgPool, agent_name: &str) -> Option<Uuid> {
+async fn resolve_agent_id(pool: &crate::db::DbPool, agent_name: &str) -> Option<String> {
     sqlx::query_scalar("SELECT agent_id FROM agents WHERE agent_name = $1")
         .bind(agent_name)
         .fetch_optional(pool)
@@ -18,7 +17,7 @@ async fn resolve_agent_id(pool: &sqlx::PgPool, agent_name: &str) -> Option<Uuid>
 }
 
 pub async fn remember(
-    pool: &sqlx::PgPool,
+    pool: &crate::db::DbPool,
     text: &str,
     global: bool,
     agent_name: &str,
@@ -41,7 +40,7 @@ pub async fn remember(
     let created_by = resolve_agent_id(pool, agent_name).await;
 
     let memory = MemoryRepo::new(pool)
-        .create(repo_id, text, created_by)
+        .create(repo_id.clone(), text, created_by)
         .await?;
 
     if json {
@@ -52,7 +51,7 @@ pub async fn remember(
     match repo_id {
         Some(rid) => {
             let scope = RepoRepo::new(pool)
-                .get(rid)
+                .get(&rid)
                 .await?
                 .map(|r| format!("{} ({})", r.name, r.task_prefix))
                 .unwrap_or_else(|| "this repo".to_string());
@@ -64,7 +63,7 @@ pub async fn remember(
 }
 
 pub async fn list(
-    pool: &sqlx::PgPool,
+    pool: &crate::db::DbPool,
     all: bool,
     limit: i64,
     json: bool,

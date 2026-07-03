@@ -5,8 +5,9 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, PgPool};
-use uuid::Uuid;
+use sqlx::FromRow;
+
+use crate::db::DbPool;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type, Serialize, Deserialize)]
 #[sqlx(type_name = "worker_state", rename_all = "snake_case")]
@@ -36,9 +37,9 @@ impl WorkerState {
 
 #[derive(Debug, Clone, FromRow)]
 pub struct Worker {
-    pub worker_id: Uuid,
-    pub task_id: Uuid,
-    pub session_id: Option<Uuid>,
+    pub worker_id: String,
+    pub task_id: String,
+    pub session_id: Option<String>,
     pub tmux_session: String,
     pub tmux_window: String,
     pub worktree_path: String,
@@ -60,11 +61,11 @@ pub struct Worker {
 }
 
 pub struct WorkerRepo<'a> {
-    pool: &'a PgPool,
+    pool: &'a DbPool,
 }
 
 impl<'a> WorkerRepo<'a> {
-    pub fn new(pool: &'a PgPool) -> Self {
+    pub fn new(pool: &'a DbPool) -> Self {
         Self { pool }
     }
 
@@ -73,8 +74,8 @@ impl<'a> WorkerRepo<'a> {
     /// observer can cross-check against `tmux list-windows`.
     pub async fn spawn(
         &self,
-        task_id: Uuid,
-        session_id: Option<Uuid>,
+        task_id: String,
+        session_id: Option<String>,
         tmux_session: &str,
         tmux_window: &str,
         worktree_path: &str,
@@ -98,8 +99,8 @@ impl<'a> WorkerRepo<'a> {
         .await
     }
 
-    pub async fn touch(&self, worker_id: Uuid) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE workers SET last_seen_at = now() WHERE worker_id = $1")
+    pub async fn touch(&self, worker_id: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE workers SET last_seen_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now') WHERE worker_id = $1")
             .bind(worker_id)
             .execute(self.pool)
             .await?;
@@ -110,7 +111,7 @@ impl<'a> WorkerRepo<'a> {
     /// merged into the repo's main branch, and the PR url if found.
     pub async fn set_delivery(
         &self,
-        worker_id: Uuid,
+        worker_id: &str,
         branch_pushed: bool,
         branch_merged: bool,
         pr_url: Option<&str>,
@@ -121,7 +122,7 @@ impl<'a> WorkerRepo<'a> {
                SET branch_pushed = $2,
                    branch_merged = $3,
                    pr_url        = COALESCE($4, pr_url),
-                   delivery_checked_at = now()
+                   delivery_checked_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now')
              WHERE worker_id = $1
             "#,
         )
@@ -136,7 +137,7 @@ impl<'a> WorkerRepo<'a> {
 
     pub async fn set_state(
         &self,
-        worker_id: Uuid,
+        worker_id: &str,
         state: WorkerState,
         exit_reason: Option<&str>,
     ) -> Result<(), sqlx::Error> {
@@ -147,15 +148,15 @@ impl<'a> WorkerRepo<'a> {
         sqlx::query(
             r#"
             UPDATE workers
-               SET state = $2::worker_state,
-                   last_seen_at = now(),
-                   ended_at = CASE WHEN $3 AND ended_at IS NULL THEN now() ELSE ended_at END,
+               SET state = $2,
+                   last_seen_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now'),
+                   ended_at = CASE WHEN $3 AND ended_at IS NULL THEN strftime('%Y-%m-%dT%H:%M:%f+00:00','now') ELSE ended_at END,
                    exit_reason = COALESCE($4, exit_reason)
              WHERE worker_id = $1
             "#,
         )
         .bind(worker_id)
-        .bind(&state)
+        .bind(state)
         .bind(terminal)
         .bind(exit_reason)
         .execute(self.pool)
@@ -175,7 +176,7 @@ impl<'a> WorkerRepo<'a> {
                       branch_pushed, branch_merged, pr_url, delivery_checked_at, intent
                  FROM workers
                 WHERE ended_at IS NULL
-                   OR (ended_at > now() - interval '24 hours'
+                   OR (ended_at > strftime('%Y-%m-%dT%H:%M:%f+00:00','now','-24 hours')
                        AND (branch_pushed = false OR branch_merged = false))
                 ORDER BY (ended_at IS NULL) DESC, started_at DESC
                 LIMIT 15"#,
@@ -199,7 +200,7 @@ impl<'a> WorkerRepo<'a> {
 
     pub async fn set_intent(
         &self,
-        worker_id: Uuid,
+        worker_id: &str,
         intent: Option<&str>,
     ) -> Result<(), sqlx::Error> {
         sqlx::query("UPDATE workers SET intent = $2 WHERE worker_id = $1")
@@ -217,7 +218,7 @@ impl<'a> WorkerRepo<'a> {
                       branch_pushed, branch_merged, pr_url, delivery_checked_at, intent
                  FROM workers
                 WHERE (state IN ('completed', 'failed') AND branch_merged = true)
-                   OR (state = 'abandoned' AND ended_at < now() - interval '1 hour')
+                   OR (state = 'abandoned' AND ended_at < strftime('%Y-%m-%dT%H:%M:%f+00:00','now','-1 hour'))
                 ORDER BY ended_at ASC
                 LIMIT 10"#,
         )
@@ -225,7 +226,7 @@ impl<'a> WorkerRepo<'a> {
         .await
     }
 
-    pub async fn get(&self, worker_id: Uuid) -> Result<Option<Worker>, sqlx::Error> {
+    pub async fn get(&self, worker_id: &str) -> Result<Option<Worker>, sqlx::Error> {
         sqlx::query_as::<_, Worker>(
             r#"SELECT worker_id, task_id, session_id, tmux_session, tmux_window,
                       worktree_path, state, started_at, last_seen_at, ended_at, exit_reason,

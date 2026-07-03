@@ -1,5 +1,5 @@
+use crate::db::DbPool;
 use chrono::{DateTime, Utc};
-use sqlx::PgPool;
 
 use crate::models::event::{Event, EventKind, EventRepo};
 
@@ -16,7 +16,7 @@ const BLUE: &str = "\x1b[38;5;111m";
 const GRAY: &str = "\x1b[38;5;245m";
 
 pub async fn execute(
-    pool: &PgPool,
+    pool: &DbPool,
     follow: bool,
     tail: i64,
     agent_name: Option<&str>,
@@ -81,7 +81,7 @@ pub async fn execute(
 }
 
 async fn filtered_recent(
-    pool: &PgPool,
+    pool: &DbPool,
     tail: i64,
     agent_name: Option<&str>,
     kinds: Option<&[String]>,
@@ -91,9 +91,9 @@ async fn filtered_recent(
     let rows: Vec<Event> = sqlx::query_as::<_, Event>(
         r#"SELECT id, event_kind, agent_id, agent_name, payload, created_at
              FROM events
-            WHERE ($1::text IS NULL OR agent_name = $1)
-              AND ($2::text[] IS NULL OR array_length($2, 1) IS NULL OR event_kind::text = ANY($2))
-              AND ($3::text IS NULL OR cc_session_id = $3)
+            WHERE ($1 IS NULL OR agent_name = $1)
+              AND ($2 IS NULL OR event_kind IN (SELECT value FROM json_each($2)))
+              AND ($3 IS NULL OR cc_session_id = $3)
             ORDER BY created_at DESC
             LIMIT $4"#,
     )
@@ -101,7 +101,7 @@ async fn filtered_recent(
     .bind(if kinds_owned.is_empty() {
         None
     } else {
-        Some(kinds_owned.clone())
+        Some(serde_json::to_string(&kinds_owned).unwrap_or_default())
     })
     .bind(cc_session_id)
     .bind(tail)
@@ -111,7 +111,7 @@ async fn filtered_recent(
 }
 
 async fn filtered_since(
-    pool: &PgPool,
+    pool: &DbPool,
     since: DateTime<Utc>,
     agent_name: Option<&str>,
     kinds: Option<&[String]>,
@@ -123,9 +123,9 @@ async fn filtered_since(
         r#"SELECT id, event_kind, agent_id, agent_name, payload, created_at
              FROM events
             WHERE created_at > $1
-              AND ($2::text IS NULL OR agent_name = $2)
-              AND ($3::text[] IS NULL OR array_length($3, 1) IS NULL OR event_kind::text = ANY($3))
-              AND ($4::text IS NULL OR cc_session_id = $4)
+              AND ($2 IS NULL OR agent_name = $2)
+              AND ($3 IS NULL OR event_kind IN (SELECT value FROM json_each($3)))
+              AND ($4 IS NULL OR cc_session_id = $4)
             ORDER BY created_at ASC
             LIMIT $5"#,
     )
@@ -134,7 +134,7 @@ async fn filtered_since(
     .bind(if kinds_owned.is_empty() {
         None
     } else {
-        Some(kinds_owned.clone())
+        Some(serde_json::to_string(&kinds_owned).unwrap_or_default())
     })
     .bind(cc_session_id)
     .bind(limit)

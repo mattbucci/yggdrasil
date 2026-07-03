@@ -1,14 +1,15 @@
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use sqlx::{FromRow, PgPool};
-use uuid::Uuid;
+use sqlx::FromRow;
+
+use crate::db::DbPool;
 
 #[derive(Debug, thiserror::Error)]
 pub enum LockError {
     #[error("resource '{resource_key}' locked by agent {holder_agent_id} until {expires_at}")]
     AlreadyHeld {
         resource_key: String,
-        holder_agent_id: Uuid,
+        holder_agent_id: String,
         expires_at: DateTime<Utc>,
     },
 
@@ -21,22 +22,22 @@ pub enum LockError {
 
 #[derive(Debug, Clone, Serialize, FromRow)]
 pub struct ResourceLock {
-    pub id: Uuid,
+    pub id: String,
     pub resource_key: String,
-    pub agent_id: Uuid,
+    pub agent_id: String,
     pub acquired_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     pub heartbeat_at: DateTime<Utc>,
 }
 
 pub struct LockManager<'a> {
-    pool: &'a PgPool,
+    pool: &'a DbPool,
     ttl_secs: u64,
     user_id: String,
 }
 
 impl<'a> LockManager<'a> {
-    pub fn new(pool: &'a PgPool, ttl_secs: u64, user_id: &str) -> Self {
+    pub fn new(pool: &'a DbPool, ttl_secs: u64, user_id: &str) -> Self {
         Self {
             pool,
             ttl_secs,
@@ -48,15 +49,28 @@ impl<'a> LockManager<'a> {
     pub async fn acquire(
         &self,
         resource_key: &str,
-        agent_id: Uuid,
+        agent_id: &str,
     ) -> Result<ResourceLock, LockError> {
+        // Postgres used a data-modifying CTE (reap + insert in one
+        // statement); SQLite doesn't allow DML in CTEs, so take the write
+        // lock up front with BEGIN IMMEDIATE and run the two statements
+        // atomically. busy_timeout + WAL absorb concurrent hook traffic.
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(LockError::Db)?;
+        sqlx::query(
+            "DELETE FROM locks WHERE resource_key = $1
+              AND expires_at < strftime('%Y-%m-%dT%H:%M:%f+00:00','now')",
+        )
+        .bind(resource_key)
+        .execute(&mut *tx)
+        .await?;
         let row: Option<ResourceLock> = sqlx::query_as::<_, ResourceLock>(
             r#"
-            WITH reap AS (
-                DELETE FROM locks WHERE resource_key = $1 AND expires_at < now()
-            )
             INSERT INTO locks (resource_key, agent_id, expires_at, user_id)
-            VALUES ($1, $2, now() + make_interval(secs => $3), $4)
+            VALUES ($1, $2, strftime('%Y-%m-%dT%H:%M:%f+00:00','now','+' || $3 || ' seconds'), $4)
             ON CONFLICT (resource_key) DO NOTHING
             RETURNING id, resource_key, agent_id, acquired_at, expires_at, heartbeat_at
             "#,
@@ -65,8 +79,9 @@ impl<'a> LockManager<'a> {
         .bind(agent_id)
         .bind(self.ttl_secs as f64)
         .bind(&self.user_id)
-        .fetch_optional(self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
+        tx.commit().await.map_err(LockError::Db)?;
 
         match row {
             Some(lock) => Ok(lock),
@@ -88,7 +103,7 @@ impl<'a> LockManager<'a> {
     }
 
     /// Release a lock.
-    pub async fn release(&self, resource_key: &str, agent_id: Uuid) -> Result<(), LockError> {
+    pub async fn release(&self, resource_key: &str, agent_id: &str) -> Result<(), LockError> {
         let result = sqlx::query("DELETE FROM locks WHERE resource_key = $1 AND agent_id = $2")
             .bind(resource_key)
             .bind(agent_id)
@@ -102,11 +117,11 @@ impl<'a> LockManager<'a> {
     }
 
     /// Heartbeat: extend the lease TTL.
-    pub async fn heartbeat(&self, resource_key: &str, agent_id: Uuid) -> Result<(), LockError> {
+    pub async fn heartbeat(&self, resource_key: &str, agent_id: &str) -> Result<(), LockError> {
         let result = sqlx::query(
             r#"
             UPDATE locks
-            SET heartbeat_at = now(), expires_at = now() + make_interval(secs => $3)
+            SET heartbeat_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now'), expires_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now','+' || $3 || ' seconds')
             WHERE resource_key = $1 AND agent_id = $2
             "#,
         )
@@ -124,9 +139,11 @@ impl<'a> LockManager<'a> {
 
     /// Reap all expired locks. Returns count reaped.
     pub async fn reap_expired(&self) -> Result<u64, sqlx::Error> {
-        let result = sqlx::query("DELETE FROM locks WHERE expires_at < now()")
-            .execute(self.pool)
-            .await?;
+        let result = sqlx::query(
+            "DELETE FROM locks WHERE expires_at < strftime('%Y-%m-%dT%H:%M:%f+00:00','now')",
+        )
+        .execute(self.pool)
+        .await?;
         Ok(result.rows_affected())
     }
 
@@ -150,7 +167,7 @@ impl<'a> LockManager<'a> {
     }
 
     /// List locks held by a specific agent.
-    pub async fn list_agent_locks(&self, agent_id: Uuid) -> Result<Vec<ResourceLock>, sqlx::Error> {
+    pub async fn list_agent_locks(&self, agent_id: &str) -> Result<Vec<ResourceLock>, sqlx::Error> {
         sqlx::query_as::<_, ResourceLock>(
             "SELECT id, resource_key, agent_id, acquired_at, expires_at, heartbeat_at FROM locks WHERE agent_id = $1",
         )
@@ -160,7 +177,7 @@ impl<'a> LockManager<'a> {
     }
 
     /// Release every lock held by an agent.
-    pub async fn release_all_for_agent(&self, agent_id: Uuid) -> Result<u64, sqlx::Error> {
+    pub async fn release_all_for_agent(&self, agent_id: &str) -> Result<u64, sqlx::Error> {
         let result = sqlx::query("DELETE FROM locks WHERE agent_id = $1")
             .bind(agent_id)
             .execute(self.pool)

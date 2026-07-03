@@ -25,7 +25,7 @@ This project uses **Yggdrasil** (`ygg`) for resource coordination and issue
 tracking across parallel Claude Code agents. The SessionStart, UserPromptSubmit,
 Stop, PreCompact, and PreToolUse hooks are active — they prime agent context,
 deliver agent-to-agent messages, record token stats, and track state in
-Postgres. You will see prime output at the top of each session
+the embedded SQLite database. You will see prime output at the top of each session
 (`<!-- ygg:prime -->`).
 
 ### Quick Reference
@@ -352,10 +352,10 @@ pub fn install_with(dir: &Path, opts: IntegrateOpts) -> Result<InstallReport, an
         if !matches!(action, ActionTaken::Unchanged) {
             // mkdir -p the parent so `--global` works on a fresh
             // machine where `~/.claude` doesn't exist yet.
-            if let Some(parent) = path.parent() {
-                if !parent.as_os_str().is_empty() {
-                    std::fs::create_dir_all(parent)?;
-                }
+            if let Some(parent) = path.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                std::fs::create_dir_all(parent)?;
             }
             let new_content = install_block(&existing, body);
             std::fs::write(&path, new_content)?;
@@ -416,13 +416,13 @@ pub fn has_managed_block(dir: &Path) -> bool {
 pub fn has_any_content(cwd: &Path) -> bool {
     for filename in ["CLAUDE.md", "AGENTS.md"] {
         let path = cwd.join(filename);
-        if path.exists() {
-            if let Ok(c) = std::fs::read_to_string(&path) {
-                // Content exists if there's anything outside the managed block.
-                let stripped = remove_block(&c);
-                if !stripped.trim().is_empty() {
-                    return true;
-                }
+        if path.exists()
+            && let Ok(c) = std::fs::read_to_string(&path)
+        {
+            // Content exists if there's anything outside the managed block.
+            let stripped = remove_block(&c);
+            if !stripped.trim().is_empty() {
+                return true;
             }
         }
     }

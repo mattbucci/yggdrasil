@@ -7,11 +7,8 @@
 //! 2. The watcher's `flag_stale_agents` is observation-only: it must NOT
 //!    transition agent state, and it MUST emit `agent_stale_warning` events.
 //!
-//! Requires Postgres + migrations applied:
-//!     DATABASE_URL=postgres://ng@localhost:5432/ygg cargo test --test watcher_consolidation -- --test-threads=1
 
-use std::env;
-use uuid::Uuid;
+mod common;
 use ygg::config::AppConfig;
 use ygg::models::agent::{AgentRepo, AgentState};
 use ygg::models::event::EventKind;
@@ -20,7 +17,7 @@ use ygg::models::task::{TaskCreate, TaskKind, TaskRepo};
 use ygg::models::task_run::{RunState, TaskRunCreate, TaskRunRepo};
 use ygg::watcher::Watcher;
 
-async fn setup(pool: &sqlx::PgPool, suffix: &str) -> (Uuid, Uuid, Uuid, Uuid) {
+async fn setup(pool: &ygg::db::DbPool, suffix: &str) -> (String, String, String, String) {
     let prefix = format!("watcher{suffix}");
     let repo = RepoRepo::new(pool)
         .register(None, &prefix, &prefix, Some(&format!("/tmp/{prefix}")))
@@ -30,7 +27,7 @@ async fn setup(pool: &sqlx::PgPool, suffix: &str) -> (Uuid, Uuid, Uuid, Uuid) {
     let labels: [String; 0] = [];
     let task = TaskRepo::new(pool)
         .create(
-            repo.repo_id,
+            &repo.repo_id,
             None,
             TaskCreate {
                 title: &format!("watcher-test-{suffix}"),
@@ -56,7 +53,7 @@ async fn setup(pool: &sqlx::PgPool, suffix: &str) -> (Uuid, Uuid, Uuid, Uuid) {
 
     let run = TaskRunRepo::new(pool)
         .create(TaskRunCreate {
-            task_id: task.task_id,
+            task_id: task.task_id.clone(),
             attempt: 1,
             input: serde_json::json!({}),
             ..Default::default()
@@ -67,7 +64,7 @@ async fn setup(pool: &sqlx::PgPool, suffix: &str) -> (Uuid, Uuid, Uuid, Uuid) {
     (repo.repo_id, task.task_id, agent.agent_id, run.run_id)
 }
 
-async fn teardown(pool: &sqlx::PgPool, repo_id: Uuid, agent_id: Uuid) {
+async fn teardown(pool: &ygg::db::DbPool, repo_id: String, agent_id: String) {
     sqlx::query("DELETE FROM repos WHERE repo_id = $1")
         .bind(repo_id)
         .execute(pool)
@@ -82,8 +79,7 @@ async fn teardown(pool: &sqlx::PgPool, repo_id: Uuid, agent_id: Uuid) {
 
 #[tokio::test]
 async fn scheduler_heartbeat_reap_produces_exactly_one_crashed_transition() {
-    let db_url = env::var("DATABASE_URL").expect("DATABASE_URL required");
-    let pool = ygg::db::create_pool(&db_url).await.unwrap();
+    let pool = common::test_db().await;
     let (repo_id, _task_id, agent_id, run_id) = setup(&pool, "soleowner").await;
 
     // Pin the run to running with a stale heartbeat.
@@ -91,14 +87,14 @@ async fn scheduler_heartbeat_reap_produces_exactly_one_crashed_transition() {
         r#"UPDATE task_runs
            SET state = 'running',
                agent_id = $2,
-               started_at = now() - interval '1 hour',
-               heartbeat_at = now() - interval '1 hour',
+               started_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now','-1 hour'),
+               heartbeat_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now','-1 hour'),
                heartbeat_ttl_s = 60
            WHERE run_id = $1"#,
     )
-    .bind(run_id)
-    .bind(agent_id)
-    .execute(&pool)
+    .bind(&run_id)
+    .bind(&agent_id)
+    .execute(&*pool)
     .await
     .unwrap();
 
@@ -110,7 +106,7 @@ async fn scheduler_heartbeat_reap_produces_exactly_one_crashed_transition() {
 
     let row: (RunState,) = sqlx::query_as("SELECT state FROM task_runs WHERE run_id = $1")
         .bind(run_id)
-        .fetch_one(&pool)
+        .fetch_one(&*pool)
         .await
         .unwrap();
     assert_eq!(row.0, RunState::Crashed);
@@ -126,26 +122,26 @@ async fn scheduler_heartbeat_reap_produces_exactly_one_crashed_transition() {
 
 #[tokio::test]
 async fn watcher_flag_stale_does_not_mutate_agent_state() {
-    let db_url = env::var("DATABASE_URL").expect("DATABASE_URL required");
-    let pool = ygg::db::create_pool(&db_url).await.unwrap();
+    let pool = common::test_db().await;
     let (repo_id, _task_id, agent_id, _run_id) = setup(&pool, "noop").await;
 
     // Force the agent into a stale executing state.
     AgentRepo::new(&pool, "test")
-        .force_state(agent_id, AgentState::Executing, None)
+        .force_state(&agent_id, AgentState::Executing, None)
         .await
         .unwrap();
-    sqlx::query("UPDATE agents SET updated_at = now() - interval '2 hours' WHERE agent_id = $1")
-        .bind(agent_id)
-        .execute(&pool)
+    sqlx::query("UPDATE agents SET updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now','-2 hours') WHERE agent_id = $1")
+        .bind(&agent_id)
+        .execute(&*pool)
         .await
         .unwrap();
 
     // Snapshot the event-id high-water-mark so we can scope our event check.
-    let watermark: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar("SELECT now()")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    let watermark: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT strftime('%Y-%m-%dT%H:%M:%f+00:00','now')")
+            .fetch_one(&*pool)
+            .await
+            .unwrap();
 
     // Boot a watcher with a tight enough lock_ttl_secs that "2 hours stale"
     // crosses the (lock_ttl_secs * 2) threshold easily.
@@ -158,8 +154,8 @@ async fn watcher_flag_stale_does_not_mutate_agent_state() {
     // Agent state must still be Executing — the watcher is observation-only.
     let still: AgentState =
         sqlx::query_scalar("SELECT current_state FROM agents WHERE agent_id = $1")
-            .bind(agent_id)
-            .fetch_one(&pool)
+            .bind(&agent_id)
+            .fetch_one(&*pool)
             .await
             .unwrap();
     assert_eq!(
@@ -176,9 +172,9 @@ async fn watcher_flag_stale_does_not_mutate_agent_state() {
              AND agent_id = $1
              AND created_at >= $2"#,
     )
-    .bind(agent_id)
+    .bind(&agent_id)
     .bind(watermark)
-    .fetch_one(&pool)
+    .fetch_one(&*pool)
     .await
     .unwrap();
     assert_eq!(count, 1, "expected exactly one stale-warning event");

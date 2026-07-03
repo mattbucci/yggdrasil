@@ -14,15 +14,14 @@
 //!
 //! Falls back to a numbered text picker if `fzf` isn't on PATH.
 
+use crate::db::DbPool;
 use crate::models::agent::AgentRepo;
 use chrono::Utc;
-use sqlx::PgPool;
 use std::io::Write;
 use std::process::{Command, Stdio};
-use uuid::Uuid;
 
 pub async fn execute(
-    pool: &PgPool,
+    pool: &DbPool,
     from: &str,
     body: &str,
     to: Option<&str>,
@@ -48,8 +47,8 @@ pub async fn execute(
 
 /// Most recent recipient this `from` agent sent a message to. Read
 /// straight from the events table — no extra state file needed.
-async fn last_recipient(pool: &PgPool, from: &str) -> Result<Option<String>, anyhow::Error> {
-    let row: Option<(Option<Uuid>,)> = sqlx::query_as(
+async fn last_recipient(pool: &DbPool, from: &str) -> Result<Option<String>, anyhow::Error> {
+    let row: Option<(Option<String>,)> = sqlx::query_as(
         r#"SELECT recipient_agent_id
              FROM events
             WHERE event_kind = 'message'
@@ -74,7 +73,7 @@ async fn last_recipient(pool: &PgPool, from: &str) -> Result<Option<String>, any
 }
 
 /// Build a row list (most-recent first) and run the user through a picker.
-async fn pick_recipient(pool: &PgPool) -> Result<String, anyhow::Error> {
+async fn pick_recipient(pool: &DbPool) -> Result<String, anyhow::Error> {
     let mut agents = AgentRepo::new(pool, crate::db::user_id()).list().await?;
     if agents.is_empty() {
         anyhow::bail!("no registered agents");

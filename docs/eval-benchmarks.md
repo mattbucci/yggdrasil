@@ -48,7 +48,7 @@ What doesn't transfer (and we don't try to fake):
                              └──────────┬───────────────────┘
                                         ▼
                             ┌───────────────────────────┐
-                            │  Postgres                 │
+                            │  SQLite                   │
                             │    bench_runs             │
                             │    bench_task_results     │
                             │    bench_metrics          │

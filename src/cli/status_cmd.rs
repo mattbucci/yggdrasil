@@ -4,7 +4,7 @@ use crate::models::worker::WorkerRepo;
 
 /// Handle `ygg status [--agent <name>] [--all-users]`
 pub async fn execute(
-    pool: &sqlx::PgPool,
+    pool: &crate::db::DbPool,
     agent_name: Option<&str>,
     all_users: bool,
 ) -> Result<(), anyhow::Error> {
@@ -23,7 +23,7 @@ pub async fn execute(
         println!("  Updated:  {}", agent.updated_at);
 
         let lock_mgr = LockManager::new(pool, 300, crate::db::user_id());
-        let locks = lock_mgr.list_agent_locks(agent.agent_id).await?;
+        let locks = lock_mgr.list_agent_locks(&agent.agent_id).await?;
         if locks.is_empty() {
             println!("  Locks:    none");
         } else {

@@ -9,7 +9,7 @@ use crate::tmux::TmuxManager;
 /// Each agent gets its own git worktree so concurrent agents never collide
 /// on the shared working directory.
 pub async fn execute(
-    pool: &sqlx::PgPool,
+    pool: &crate::db::DbPool,
     _config: &AppConfig,
     task: &str,
     name: Option<&str>,

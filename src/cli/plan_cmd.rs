@@ -18,24 +18,25 @@ use crate::models::task::{Task, TaskKind, TaskRepo, TaskStatus};
 use crate::worktree;
 
 pub async fn create(
-    pool: &sqlx::PgPool,
+    pool: &crate::db::DbPool,
     title: &str,
     description: Option<&str>,
     agent_name: &str,
 ) -> Result<Task, anyhow::Error> {
     let repo = crate::cli::task_cmd::resolve_cwd_repo(pool).await?;
     let task_repo = TaskRepo::new(pool);
-    let agent_id =
-        sqlx::query_scalar::<_, Option<Uuid>>("SELECT agent_id FROM agents WHERE agent_name = $1")
-            .bind(agent_name)
-            .fetch_optional(pool)
-            .await?
-            .flatten();
+    let agent_id = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT agent_id FROM agents WHERE agent_name = $1",
+    )
+    .bind(agent_name)
+    .fetch_optional(pool)
+    .await?
+    .flatten();
 
     let created = task_repo
         .create(
-            repo.repo_id,
-            agent_id,
+            &repo.repo_id,
+            agent_id.clone(),
             crate::models::task::TaskCreate {
                 title,
                 description: description.unwrap_or(""),
@@ -59,7 +60,7 @@ pub async fn create(
 }
 
 pub async fn add(
-    pool: &sqlx::PgPool,
+    pool: &crate::db::DbPool,
     epic_ref: &str,
     title: &str,
     description: Option<&str>,
@@ -69,15 +70,16 @@ pub async fn add(
 ) -> Result<Task, anyhow::Error> {
     let epic = crate::cli::task_cmd::resolve_task_public(pool, epic_ref).await?;
     let repo = RepoRepo::new(pool)
-        .get(epic.repo_id)
+        .get(&epic.repo_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("repo vanished"))?;
-    let agent_id =
-        sqlx::query_scalar::<_, Option<Uuid>>("SELECT agent_id FROM agents WHERE agent_name = $1")
-            .bind(agent_name)
-            .fetch_optional(pool)
-            .await?
-            .flatten();
+    let agent_id = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT agent_id FROM agents WHERE agent_name = $1",
+    )
+    .bind(agent_name)
+    .fetch_optional(pool)
+    .await?
+    .flatten();
     let task_kind = match kind {
         Some(k) => <TaskKind as std::str::FromStr>::from_str(k).map_err(|e| anyhow::anyhow!(e))?,
         None => TaskKind::Task,
@@ -86,7 +88,7 @@ pub async fn add(
     let task_repo = TaskRepo::new(pool);
     let child = task_repo
         .create(
-            repo.repo_id,
+            &repo.repo_id,
             agent_id,
             crate::models::task::TaskCreate {
                 title,
@@ -105,10 +107,10 @@ pub async fn add(
         .await?;
 
     // Wire the child under the epic and apply declared deps.
-    task_repo.add_dep(epic.task_id, child.task_id).await?;
+    task_repo.add_dep(&epic.task_id, &child.task_id).await?;
     for d in deps {
         let dep = crate::cli::task_cmd::resolve_task_public(pool, d).await?;
-        task_repo.add_dep(child.task_id, dep.task_id).await?;
+        task_repo.add_dep(&child.task_id, &dep.task_id).await?;
     }
 
     println!(
@@ -125,27 +127,27 @@ pub async fn add(
 /// transitively — nested epics flatten). An epic's "children" in work
 /// terms are the sub-tasks blocking its completion, so we follow the
 /// blockers_of edge, not children_of.
-async fn descendants(pool: &sqlx::PgPool, root: Uuid) -> Result<Vec<Uuid>, anyhow::Error> {
-    let edges: Vec<(Uuid, Uuid)> = sqlx::query_as("SELECT task_id, blocker_id FROM task_deps")
+async fn descendants(pool: &crate::db::DbPool, root: String) -> Result<Vec<String>, anyhow::Error> {
+    let edges: Vec<(String, String)> = sqlx::query_as("SELECT task_id, blocker_id FROM task_deps")
         .fetch_all(pool)
         .await?;
-    let mut blockers_of: std::collections::HashMap<Uuid, Vec<Uuid>> = Default::default();
+    let mut blockers_of: std::collections::HashMap<String, Vec<String>> = Default::default();
     for (t, b) in edges {
         blockers_of.entry(t).or_default().push(b);
     }
 
     let mut seen = std::collections::HashSet::new();
-    let mut frontier = vec![root];
+    let mut frontier = vec![root.clone()];
     let mut out = Vec::new();
     while let Some(id) = frontier.pop() {
-        if !seen.insert(id) {
+        if !seen.insert(id.clone()) {
             continue;
+        }
+        if let Some(blockers) = blockers_of.get(&id) {
+            frontier.extend(blockers.iter().cloned());
         }
         if id != root {
             out.push(id);
-        }
-        if let Some(blockers) = blockers_of.get(&id) {
-            frontier.extend(blockers.iter().copied());
         }
     }
     Ok(out)
@@ -156,7 +158,7 @@ async fn descendants(pool: &sqlx::PgPool, root: Uuid) -> Result<Vec<Uuid>, anyho
 /// exits when no open tasks remain in the epic. Each spawn goes through
 /// the same `run` path, so every task gets a worktree + priming prompt.
 pub async fn supervise(
-    pool: &sqlx::PgPool,
+    pool: &crate::db::DbPool,
     epic_ref: &str,
     agent_name: &str,
     parallelism: usize,
@@ -165,11 +167,11 @@ pub async fn supervise(
 ) -> Result<(), anyhow::Error> {
     let epic = crate::cli::task_cmd::resolve_task_public(pool, epic_ref).await?;
     let repo = RepoRepo::new(pool)
-        .get(epic.repo_id)
+        .get(&epic.repo_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("repo vanished"))?;
 
-    let all_descendants = descendants(pool, epic.task_id).await?;
+    let all_descendants = descendants(pool, epic.task_id.clone()).await?;
     if all_descendants.is_empty() {
         println!("Epic {} has no children — nothing to supervise.", epic_ref);
         return Ok(());
@@ -186,9 +188,9 @@ pub async fn supervise(
             r#"SELECT task_id, repo_id, seq, title, description, acceptance, design, notes,
                       kind, status, priority, created_by, assignee, human_flag,
                       created_at, updated_at, closed_at, close_reason, relevance
-               FROM tasks WHERE task_id = ANY($1)"#,
+               FROM tasks WHERE task_id IN (SELECT value FROM json_each($1))"#,
         )
-        .bind(&all_descendants)
+        .bind(serde_json::to_string(&all_descendants).unwrap_or_default())
         .fetch_all(pool)
         .await?;
 
@@ -223,7 +225,7 @@ pub async fn supervise(
             return Ok(());
         }
 
-        if is_paused(epic.task_id) {
+        if is_paused(&epic.task_id) {
             println!(
                 "[{}] paused — use `ygg plan resume {epic_ref}` to continue",
                 timestamp()
@@ -238,9 +240,9 @@ pub async fn supervise(
         // Find ready tasks: status=Open AND all blockers successfully
         // Closed (a failed blocker does NOT unblock downstream — downstream
         // waits for the human to retry or intervene).
-        let id_to_status: std::collections::HashMap<Uuid, (TaskStatus, bool)> = tasks
+        let id_to_status: std::collections::HashMap<String, (TaskStatus, bool)> = tasks
             .iter()
-            .map(|t| (t.task_id, (t.status.clone(), is_failed(t))))
+            .map(|t| (t.task_id.clone(), (t.status.clone(), is_failed(t))))
             .collect();
         let task_repo = TaskRepo::new(pool);
         let capacity = parallelism.saturating_sub(running_count);
@@ -260,7 +262,7 @@ pub async fn supervise(
                 if t.status != TaskStatus::Open {
                     continue;
                 }
-                let deps = task_repo.deps(t.task_id).await?;
+                let deps = task_repo.deps(&t.task_id).await?;
                 let blockers_clear = deps.iter().all(|d| {
                     match id_to_status.get(&d.task_id) {
                         Some((TaskStatus::Closed, false)) => true,
@@ -279,10 +281,8 @@ pub async fn supervise(
                     timestamp(),
                     &t.title[..t.title.len().min(60)]
                 );
-                if !dry_run {
-                    if let Err(e) = run(pool, &task_ref, agent_name, false).await {
-                        eprintln!("  ! spawn failed: {e}");
-                    }
+                if !dry_run && let Err(e) = run(pool, &task_ref, agent_name, false).await {
+                    eprintln!("  ! spawn failed: {e}");
                 }
                 spawned += 1;
             }
@@ -310,7 +310,7 @@ fn timestamp() -> String {
 
 /// File-based pause flag. No schema change needed, file absent = running.
 /// Path: $XDG_STATE_HOME/ygg/plans/<task_id>.paused (or ~/.local/state).
-fn pause_flag_path(task_id: Uuid) -> Result<std::path::PathBuf, anyhow::Error> {
+fn pause_flag_path(task_id: &str) -> Result<std::path::PathBuf, anyhow::Error> {
     let base = if let Ok(x) = std::env::var("XDG_STATE_HOME") {
         if !x.is_empty() {
             std::path::PathBuf::from(x)
@@ -323,9 +323,9 @@ fn pause_flag_path(task_id: Uuid) -> Result<std::path::PathBuf, anyhow::Error> {
     Ok(base.join("ygg/plans").join(format!("{task_id}.paused")))
 }
 
-pub async fn pause(pool: &sqlx::PgPool, epic_ref: &str) -> Result<(), anyhow::Error> {
+pub async fn pause(pool: &crate::db::DbPool, epic_ref: &str) -> Result<(), anyhow::Error> {
     let epic = crate::cli::task_cmd::resolve_task_public(pool, epic_ref).await?;
-    let path = pause_flag_path(epic.task_id)?;
+    let path = pause_flag_path(&epic.task_id)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -335,15 +335,15 @@ pub async fn pause(pool: &sqlx::PgPool, epic_ref: &str) -> Result<(), anyhow::Er
     Ok(())
 }
 
-pub async fn resume(pool: &sqlx::PgPool, epic_ref: &str) -> Result<(), anyhow::Error> {
+pub async fn resume(pool: &crate::db::DbPool, epic_ref: &str) -> Result<(), anyhow::Error> {
     let epic = crate::cli::task_cmd::resolve_task_public(pool, epic_ref).await?;
-    let path = pause_flag_path(epic.task_id)?;
+    let path = pause_flag_path(&epic.task_id)?;
     let _ = std::fs::remove_file(&path);
     println!("resumed {epic_ref}");
     Ok(())
 }
 
-fn is_paused(task_id: Uuid) -> bool {
+fn is_paused(task_id: &str) -> bool {
     pause_flag_path(task_id)
         .map(|p| p.exists())
         .unwrap_or(false)
@@ -353,19 +353,19 @@ fn is_paused(task_id: Uuid) -> bool {
 /// archive, so the branch remains for inspection), sets status back to
 /// open, releases locks held by the agent associated with the supervise.
 pub async fn abort(
-    pool: &sqlx::PgPool,
+    pool: &crate::db::DbPool,
     epic_ref: &str,
     agent_name: &str,
 ) -> Result<(), anyhow::Error> {
     let epic = crate::cli::task_cmd::resolve_task_public(pool, epic_ref).await?;
-    let ids = descendants(pool, epic.task_id).await?;
+    let ids = descendants(pool, epic.task_id.clone()).await?;
     let tasks: Vec<Task> = sqlx::query_as::<_, Task>(
         r#"SELECT task_id, repo_id, seq, title, description, acceptance, design, notes,
                   kind, status, priority, created_by, assignee, human_flag,
                   created_at, updated_at, closed_at, close_reason, relevance
-           FROM tasks WHERE task_id = ANY($1) AND status = 'in_progress'"#,
+           FROM tasks WHERE task_id IN (SELECT value FROM json_each($1)) AND status = 'in_progress'"#,
     )
-    .bind(&ids)
+    .bind(serde_json::to_string(&ids).unwrap_or_default())
     .fetch_all(pool)
     .await?;
 
@@ -375,42 +375,43 @@ pub async fn abort(
     );
     for t in &tasks {
         let repo = RepoRepo::new(pool)
-            .get(t.repo_id)
+            .get(&t.repo_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("repo vanished"))?;
         let r = format!("{}-{}", repo.task_prefix, t.seq);
         println!("  · {r}  dropping worktree (policy=archive) + reverting to open");
         let _ = crate::worktree::teardown(
             pool,
-            t.task_id,
+            t.task_id.clone(),
             crate::worktree::TeardownPolicy::Archive,
             true,
         )
         .await;
         let _ = TaskRepo::new(pool)
-            .set_status(t.task_id, TaskStatus::Open, None, None)
+            .set_status(&t.task_id, TaskStatus::Open, None, None)
             .await;
     }
 
     // Mark paused so supervisor doesn't immediately re-spawn on next run.
-    let _ = std::fs::create_dir_all(pause_flag_path(epic.task_id)?.parent().unwrap());
+    let _ = std::fs::create_dir_all(pause_flag_path(&epic.task_id)?.parent().unwrap());
     let _ = std::fs::write(
-        pause_flag_path(epic.task_id)?,
+        pause_flag_path(&epic.task_id)?,
         format!("aborted at {}", chrono::Utc::now()),
     );
 
     println!("releasing locks held by agent '{agent_name}'…");
     let lock_mgr = crate::lock::LockManager::new(pool, 300, crate::db::user_id());
     let locks = lock_mgr.list_all().await.unwrap_or_default();
-    let agent_id =
-        sqlx::query_scalar::<_, Option<Uuid>>("SELECT agent_id FROM agents WHERE agent_name = $1")
-            .bind(agent_name)
-            .fetch_optional(pool)
-            .await?
-            .flatten();
+    let agent_id = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT agent_id FROM agents WHERE agent_name = $1",
+    )
+    .bind(agent_name)
+    .fetch_optional(pool)
+    .await?
+    .flatten();
     if let Some(aid) = agent_id {
         for l in locks.iter().filter(|l| l.agent_id == aid) {
-            let _ = lock_mgr.release(&l.resource_key, aid).await;
+            let _ = lock_mgr.release(&l.resource_key, &aid).await;
         }
     }
     println!("done. To resume after investigating: ygg plan resume {epic_ref}");
@@ -433,7 +434,7 @@ fn is_failed(task: &Task) -> bool {
 /// CLI entry passes a println-backed one; the TUI passes a capture-
 /// into-flash one. Returns (ok, last-line-of-status-for-flash).
 pub async fn run(
-    pool: &sqlx::PgPool,
+    pool: &crate::db::DbPool,
     task_ref: &str,
     agent_name: &str,
     dry_run: bool,
@@ -448,7 +449,7 @@ pub async fn run(
 /// Core logic — all status goes through the reporter closure. Returns
 /// the final headline string (for the TUI flash).
 pub async fn run_with_reporter(
-    pool: &sqlx::PgPool,
+    pool: &crate::db::DbPool,
     task_ref: &str,
     agent_name: &str,
     dry_run: bool,
@@ -456,13 +457,13 @@ pub async fn run_with_reporter(
 ) -> Result<String, anyhow::Error> {
     let task = crate::cli::task_cmd::resolve_task_public(pool, task_ref).await?;
     let repo = RepoRepo::new(pool)
-        .get(task.repo_id)
+        .get(&task.repo_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("repo vanished"))?;
 
     // Refuse to run a task whose blockers aren't all closed — that's the
     // supervisor's job; single-shot run should be a leaf operation.
-    let deps = TaskRepo::new(pool).deps(task.task_id).await?;
+    let deps = TaskRepo::new(pool).deps(&task.task_id).await?;
     let unresolved: Vec<_> = deps
         .iter()
         .filter(|d| d.status != TaskStatus::Closed)
@@ -493,25 +494,26 @@ pub async fn run_with_reporter(
         reporter(&format!(
             "  2. claim task (assignee = {agent_name}, status → in_progress)"
         ));
-        reporter(&format!("  3. tmux new-session in the worktree"));
+        reporter("  3. tmux new-session in the worktree");
         reporter("  4. launch `claude` with a priming prompt");
         return Ok("dry-run printed".to_string());
     }
 
     // 1. Worktree
-    let wt = worktree::ensure(pool, task.task_id).await?;
+    let wt = worktree::ensure(pool, task.task_id.clone()).await?;
     reporter(&format!("worktree: {}", wt.path.display()));
 
     // 2. Claim the task
-    let agent_id =
-        sqlx::query_scalar::<_, Option<Uuid>>("SELECT agent_id FROM agents WHERE agent_name = $1")
-            .bind(agent_name)
-            .fetch_optional(pool)
-            .await?
-            .flatten();
+    let agent_id = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT agent_id FROM agents WHERE agent_name = $1",
+    )
+    .bind(agent_name)
+    .fetch_optional(pool)
+    .await?
+    .flatten();
     if let Some(aid) = agent_id {
         let _ = TaskRepo::new(pool)
-            .set_status(task.task_id, TaskStatus::InProgress, Some(aid), None)
+            .set_status(&task.task_id, TaskStatus::InProgress, Some(aid), None)
             .await;
     }
 
@@ -724,15 +726,15 @@ fn prime_prompt(task: &Task, repo: &crate::models::repo::Repo) -> String {
     if !task.description.is_empty() {
         p.push_str(&format!("**Description:**\n{}\n\n", task.description));
     }
-    if let Some(a) = &task.acceptance {
-        if !a.is_empty() {
-            p.push_str(&format!("**Acceptance:**\n{a}\n\n"));
-        }
+    if let Some(a) = &task.acceptance
+        && !a.is_empty()
+    {
+        p.push_str(&format!("**Acceptance:**\n{a}\n\n"));
     }
-    if let Some(d) = &task.design {
-        if !d.is_empty() {
-            p.push_str(&format!("**Design:**\n{d}\n\n"));
-        }
+    if let Some(d) = &task.design
+        && !d.is_empty()
+    {
+        p.push_str(&format!("**Design:**\n{d}\n\n"));
     }
     p.push_str(
         "Work in this git worktree. When complete, close the task with:\n  \

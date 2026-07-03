@@ -12,7 +12,7 @@ Today Yggdrasil makes exactly one kind of LLM call:
 Ollama.embed(text) → 384-dim vector
 ```
 
-That call fires from `ygg inject` (per user turn, per prompt) and from `ygg digest` (per completed session, per turn block). Everything else in the system — task management, lock coordination, correction detection, digest summarization — runs in shell or Rust against Postgres. No inference.
+That call fires from `ygg inject` (per user turn, per prompt) and from `ygg digest` (per completed session, per turn block). Everything else in the system — task management, lock coordination, correction detection, digest summarization — runs in shell or Rust against the embedded SQLite database. No inference.
 
 Nothing about this is wrong. It's the [substrate-separation](design-principles.md#substrate-separation) principle in its purest form: the cheap substrate handles everything the cheap substrate can handle, and the expensive substrate (the agent) never pays for housekeeping. But *zero* inference below the agent is too far in the cheap direction — there are jobs that a small local model does dramatically better than heuristics, and we're leaving that capability on the table.
 
@@ -115,7 +115,7 @@ Surfaced in `ygg prime` and in the TUI dashboard. Scheduled via `ygg watcher` on
 
 The temptation with a local model is to reach for it whenever anything is vaguely fuzzy. Resist. Substrate-separation cuts both ways:
 
-- **Don't use the LLM for lock decisions.** Postgres `UNIQUE` is already correct. Adding a "does this lock conflict" LLM call is worse on every axis.
+- **Don't use the LLM for lock decisions.** A SQL `UNIQUE` constraint is already correct. Adding a "does this lock conflict" LLM call is worse on every axis.
 - **Don't use the LLM for task dependency cycles.** The recursive CTE catches every cycle in O(edges). Asking a model to reason about it is slower and less correct.
 - **Don't use the LLM for exact-match work.** If grep or `tsvector` answers the question, ship grep.
 - **Don't pipe every tool call through the LLM.** Most tool results carry their own semantics — don't paraphrase output the agent will read directly anyway.

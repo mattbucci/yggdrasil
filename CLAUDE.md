@@ -4,7 +4,7 @@ This project **is** Yggdrasil — a multi-agent coordination layer. We dogfood i
 
 ## Working in This Repo (Dogfooded Coordination)
 
-The SessionStart, UserPromptSubmit, Stop, PreCompact, and PreToolUse hooks are active. They prime agent context, deliver agent-to-agent messages, record token stats, enforce locks, and track state in Postgres. You will see prime output at the top of each session (`<!-- ygg:prime -->`). (ADR 0015: the similarity-retrieval / embedding layer was removed — there is no longer a `[ygg memory | ...]` injection. `ygg remember` was later re-added as a plain, non-embedding note store; see below.)
+The SessionStart, UserPromptSubmit, Stop, PreCompact, and PreToolUse hooks are active. They prime agent context, deliver agent-to-agent messages, record token stats, enforce locks, and track state in the embedded SQLite database. You will see prime output at the top of each session (`<!-- ygg:prime -->`). (ADR 0015: the similarity-retrieval / embedding layer was removed — there is no longer a `[ygg memory | ...]` injection. `ygg remember` was later re-added as a plain, non-embedding note store; see below.)
 
 ### Quick Reference
 
@@ -96,9 +96,8 @@ cp -f src dst     mv -f src dst     rm -f file     rm -rf dir     cp -rf src dst
 
 ```bash
 cargo build --release        # Build the ygg binary
-cargo test                   # Run tests (requires Postgres via docker-compose)
-docker-compose up -d         # Start Postgres
-ygg migrate                  # Run migrations
+cargo test                   # Run tests (embedded SQLite — each test gets its own temp DB; no services needed)
+ygg migrate                  # Run migrations (DB auto-created at $XDG_DATA_HOME/ygg/ygg.db)
 make install                 # Build + install to ~/.local/bin/ygg + verify
 make reinstall               # Re-sign + verify the existing install (recovery)
 ```
@@ -128,7 +127,7 @@ collisions between concurrent agents.
 - **src/models/**: `agent` (state machine), `task` / `task_run` (tracking + scheduler runs), `event` (live stream).
 - **src/cli/**: one file per subcommand — `prime`, `spawn`, `lock`, `interrupt`, `status`, `logs`, `task_cmd`, `run_cmd`, `scheduler_cmd`, `hook_cmd`.
 - **src/lock.rs, src/scheduler.rs**: coordination primitives.
-- **migrations/**: Postgres schema (`uuid-ossp`). ADR 0015 removed `pgvector` and the embedding/`nodes` tables.
+- **migrations/**: SQLite schema (single squashed baseline; the tool was ported off Postgres in 2026-07). ADR 0015 removed the embedding/`nodes` tables.
 - **Hooks** → native `ygg hook <event>` handlers, installed by `ygg init` at Claude Code lifecycle events.
 
 <!-- BEGIN YGG INTEGRATION v:4 hash:8de7570e -->
@@ -139,7 +138,7 @@ This project uses **Yggdrasil** (`ygg`) for resource coordination and issue
 tracking across parallel Claude Code agents. The SessionStart, UserPromptSubmit,
 Stop, PreCompact, and PreToolUse hooks are active — they prime agent context,
 deliver agent-to-agent messages, record token stats, and track state in
-Postgres. You will see prime output at the top of each session
+the embedded SQLite database. You will see prime output at the top of each session
 (`<!-- ygg:prime -->`).
 
 ### Quick Reference
@@ -215,9 +214,9 @@ What: raise the pool default to 32; accept a YGG_DB_POOL override.
 Context: the scheduler, watcher, TUI, and per-agent hooks all draw from one
 sqlx pool. At 10 connections a >50-agent fleet blocks on connection-wait, which
 surfaces as spurious tick lag (looked like a scheduler bug for a week). We chose
-32 as the floor that cleared the lag in the bench without exhausting Postgres'
-default 100 max_connections, leaving headroom for psql/manual sessions. Rejected
-making it unbounded (risks hitting Postgres' cap) and per-component pools (more
+32 as the floor that cleared the lag in the bench while staying well inside
+SQLite's comfortable concurrent-connection range under WAL. Rejected
+making it unbounded (needless FD pressure) and per-component pools (more
 moving parts). Knob lives next to the pool builder in src/db.rs." \
   --acceptance "- [ ] src/db.rs default = 32
 - [ ] YGG_DB_POOL parses to u32, falls back to 32 on parse error

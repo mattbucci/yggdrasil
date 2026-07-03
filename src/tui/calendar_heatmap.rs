@@ -14,10 +14,10 @@
 //!   < 75%         → orange
 //!   ≥ 75%         → red
 
+use crate::db::DbPool;
 use ratatui::layout::Rect;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
-use sqlx::PgPool;
 
 /// One bucketed sample. `total` is the run count in this (day, hour);
 /// `failed` is how many of those landed in a failure terminal state.
@@ -61,18 +61,18 @@ impl CalendarHeatmap {
         }
     }
 
-    pub async fn refresh(&mut self, pool: &PgPool) -> Result<(), anyhow::Error> {
+    pub async fn refresh(&mut self, pool: &DbPool) -> Result<(), anyhow::Error> {
         self.loaded = true;
-        // dow returns 0=Sunday, 1=Monday, …, 6=Saturday in Postgres.
+        // dow (strftime('%w')) returns 0=Sunday, 1=Monday, …, 6=Saturday.
         // Calendar convention here is Mon=0..Sun=6, so remap below.
         let rows: Vec<(i32, i32, i64, i64)> = sqlx::query_as(
             r#"SELECT
-                 EXTRACT(DOW  FROM ended_at)::int AS dow,
-                 EXTRACT(HOUR FROM ended_at)::int AS hour,
-                 COUNT(*)::bigint                  AS total,
-                 COUNT(*) FILTER (WHERE state IN ('failed','crashed','poison'))::bigint AS failed
+                 CAST(strftime('%w', ended_at) AS INTEGER) AS dow,
+                 CAST(strftime('%H', ended_at) AS INTEGER) AS hour,
+                 COUNT(*)                  AS total,
+                 COUNT(*) FILTER (WHERE state IN ('failed','crashed','poison')) AS failed
                FROM task_runs
-               WHERE ended_at > now() - interval '7 days'
+               WHERE ended_at > strftime('%Y-%m-%dT%H:%M:%f+00:00','now','-7 days')
                  AND ended_at IS NOT NULL
                GROUP BY dow, hour"#,
         )
@@ -81,12 +81,12 @@ impl CalendarHeatmap {
 
         let mut grid: HeatGrid = [[HeatCell::default(); 24]; 7];
         for (dow_pg, hour, total, failed) in rows {
-            // Postgres dow: 0=Sun … 6=Sat → calendar row Mon=0..Sun=6.
+            // dow: 0=Sun … 6=Sat → calendar row Mon=0..Sun=6.
             let calendar_row = match dow_pg {
                 0 => 6,                // Sun
                 d => (d - 1) as usize, // Mon..Sat → 0..5
             };
-            if calendar_row >= 7 || hour < 0 || hour >= 24 {
+            if calendar_row >= 7 || !(0..24).contains(&hour) {
                 continue;
             }
             grid[calendar_row][hour as usize] = HeatCell {

@@ -47,8 +47,9 @@ fn narrow_terminal_renders_compact_tab_labels_only() {
         !row.contains("Dashboard"),
         "narrow row should NOT carry the word 'Dashboard': {row:?}"
     );
-    // All eleven activator keys are still present so the user can switch.
-    for key in ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "R"] {
+    // Every activator key is still present so the user can switch.
+    // (Keys mirror the compact tab registry in src/tui/app.rs.)
+    for key in ["1", "2", "3", "5", "9", "0", "G", "N"] {
         assert!(
             row.contains(key),
             "narrow row missing activator {key}: {row:?}"

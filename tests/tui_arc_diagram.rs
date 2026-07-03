@@ -7,12 +7,12 @@ use ygg::tui::arc_diagram::{
 
 fn node(label: &str) -> DagNode {
     DagNode {
-        task_id: Uuid::new_v4(),
+        task_id: Uuid::new_v4().to_string(),
         label: label.into(),
     }
 }
 
-fn edge(from: Uuid, to: Uuid) -> DagEdge {
+fn edge(from: String, to: String) -> DagEdge {
     DagEdge { from, to }
 }
 
@@ -30,7 +30,10 @@ fn linear_chain_increments_depth() {
     let c = node("c");
     let depths = longest_path_depths(
         &[a.clone(), b.clone(), c.clone()],
-        &[edge(a.task_id, b.task_id), edge(b.task_id, c.task_id)],
+        &[
+            edge(a.task_id.clone(), b.task_id.clone()),
+            edge(b.task_id.clone(), c.task_id.clone()),
+        ],
     );
     assert_eq!(depths[&a.task_id], 0);
     assert_eq!(depths[&b.task_id], 1);
@@ -48,10 +51,10 @@ fn diamond_takes_longest_path_for_depth() {
     let depths = longest_path_depths(
         &[a.clone(), b.clone(), c.clone(), d.clone()],
         &[
-            edge(a.task_id, b.task_id),
-            edge(a.task_id, c.task_id),
-            edge(b.task_id, c.task_id),
-            edge(c.task_id, d.task_id),
+            edge(a.task_id.clone(), b.task_id.clone()),
+            edge(a.task_id.clone(), c.task_id.clone()),
+            edge(b.task_id.clone(), c.task_id.clone()),
+            edge(c.task_id.clone(), d.task_id.clone()),
         ],
     );
     assert_eq!(depths[&d.task_id], 3, "longest path a→b→c→d = depth 3");
@@ -65,7 +68,7 @@ fn assign_positions_groups_same_depth_into_distinct_columns() {
     // Two roots + one child: a, b at depth 0; c child of a at depth 1.
     let depths = longest_path_depths(
         &[a.clone(), b.clone(), c.clone()],
-        &[edge(a.task_id, c.task_id)],
+        &[edge(a.task_id.clone(), c.task_id.clone())],
     );
     let pos = assign_positions(&[a.clone(), b.clone(), c.clone()], &depths);
     assert_eq!(pos[&a.task_id].column, 0);
@@ -83,9 +86,9 @@ fn critical_path_walks_longest_chain() {
     let path = critical_path(
         &[a.clone(), b.clone(), c.clone(), d.clone()],
         &[
-            edge(a.task_id, b.task_id),
-            edge(b.task_id, c.task_id),
-            edge(a.task_id, d.task_id),
+            edge(a.task_id.clone(), b.task_id.clone()),
+            edge(b.task_id.clone(), c.task_id.clone()),
+            edge(a.task_id.clone(), d.task_id.clone()),
         ],
     );
     assert_eq!(path.len(), 3);

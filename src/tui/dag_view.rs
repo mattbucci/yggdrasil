@@ -4,11 +4,10 @@
 //! pane: here we see roots (epics, unblocked tasks) at the top and
 //! their children indented below, with dependency arrows visible.
 
+use crate::db::DbPool;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState};
-use sqlx::PgPool;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use uuid::Uuid;
 
 use crate::models::agent::AgentRepo;
 use crate::models::repo::{Repo, RepoRepo};
@@ -42,7 +41,7 @@ impl DagSort {
 #[derive(Debug, Clone, PartialEq)]
 pub enum AgentFilter {
     All,
-    Specific(Uuid),
+    Specific(String),
     Unassigned,
 }
 
@@ -63,10 +62,10 @@ pub struct DagView {
     /// Cleared on the next refresh after a few ticks.
     pub flash: String,
     /// When set, only this task and its descendants (via task_deps) render.
-    pub subtree_focus: Option<Uuid>,
+    pub subtree_focus: Option<String>,
     /// Cached assignee list, populated each refresh: (agent_id, agent_name).
     /// Drives the `a` cycle without a DB hit per keypress.
-    pub known_assignees: Vec<(Uuid, String)>,
+    pub known_assignees: Vec<(String, String)>,
     /// Display label for the subtree focus, shown in the title while active.
     pub focus_label: String,
     /// Flipped true once `refresh` has executed at least once. Until then the
@@ -77,11 +76,11 @@ pub struct DagView {
     /// Armed by Backspace; next key must be `y` to actually delete.
     /// Stored with the display label so the confirm line stays accurate
     /// even if the selection moves.
-    pub pending_delete: Option<(Uuid, String)>,
+    pub pending_delete: Option<(String, String)>,
     // Dependency edge maps — persisted from refresh for the dep tree panel.
-    children_of: HashMap<Uuid, Vec<Uuid>>,
-    blockers_of: HashMap<Uuid, Vec<Uuid>>,
-    tasks_by_id: HashMap<Uuid, (Task, String)>,
+    children_of: HashMap<String, Vec<String>>,
+    blockers_of: HashMap<String, Vec<String>>,
+    tasks_by_id: HashMap<String, (Task, String)>,
 }
 
 pub enum RenderRow {
@@ -97,6 +96,12 @@ pub enum RenderRow {
         is_root: bool,
         n_children: usize,
     },
+}
+
+impl Default for DagView {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DagView {
@@ -156,7 +161,7 @@ impl DagView {
         self.agent_filter = match &self.agent_filter {
             AgentFilter::All => {
                 if let Some((id, _)) = self.known_assignees.first() {
-                    AgentFilter::Specific(*id)
+                    AgentFilter::Specific(id.clone())
                 } else {
                     AgentFilter::Unassigned
                 }
@@ -165,7 +170,7 @@ impl DagView {
                 let idx = self.known_assignees.iter().position(|(id, _)| id == cur);
                 match idx {
                     Some(i) if i + 1 < self.known_assignees.len() => {
-                        AgentFilter::Specific(self.known_assignees[i + 1].0)
+                        AgentFilter::Specific(self.known_assignees[i + 1].0.clone())
                     }
                     _ => AgentFilter::Unassigned,
                 }
@@ -186,13 +191,13 @@ impl DagView {
             task.seq,
             task.title.chars().take(40).collect::<String>()
         );
-        match self.subtree_focus {
-            Some(id) if id == task.task_id => {
+        match &self.subtree_focus {
+            Some(id) if *id == task.task_id => {
                 self.subtree_focus = None;
                 self.focus_label.clear();
             }
             _ => {
-                self.subtree_focus = Some(task.task_id);
+                self.subtree_focus = Some(task.task_id.clone());
                 self.focus_label = label;
             }
         }
@@ -233,10 +238,10 @@ impl DagView {
     /// Toggle the detail overlay for the selected task row. Does nothing for
     /// repo-header rows since there's no task to show.
     pub fn toggle_detail(&mut self) {
-        if let Some(i) = self.state.selected() {
-            if matches!(self.rows.get(i), Some(RenderRow::Task { .. })) {
-                self.detail_open = !self.detail_open;
-            }
+        if let Some(i) = self.state.selected()
+            && matches!(self.rows.get(i), Some(RenderRow::Task { .. }))
+        {
+            self.detail_open = !self.detail_open;
         }
     }
 
@@ -250,9 +255,9 @@ impl DagView {
 
     /// task_id + display label ("yggdrasil-42") for the selected row, if any.
     /// app.rs uses this for the backspace-delete confirm flow.
-    pub fn selected_task_id(&self) -> Option<(Uuid, String)> {
+    pub fn selected_task_id(&self) -> Option<(String, String)> {
         self.selected_task()
-            .map(|(t, p)| (t.task_id, format!("{p}-{}", t.seq)))
+            .map(|(t, p)| (t.task_id.clone(), format!("{p}-{}", t.seq)))
     }
 
     /// Arm delete confirmation for the currently selected task. Next key must
@@ -263,7 +268,7 @@ impl DagView {
     pub fn delete_cancel(&mut self) {
         self.pending_delete = None;
     }
-    pub fn take_pending_delete(&mut self) -> Option<Uuid> {
+    pub fn take_pending_delete(&mut self) -> Option<String> {
         self.pending_delete.take().map(|(id, _)| id)
     }
 
@@ -309,7 +314,7 @@ impl DagView {
         Some((parent, title))
     }
 
-    pub async fn refresh(&mut self, pool: &PgPool) -> Result<(), anyhow::Error> {
+    pub async fn refresh(&mut self, pool: &DbPool) -> Result<(), anyhow::Error> {
         // Whole-system view: show all open tasks across every repo, grouped
         // by repo header. Deliberately NOT cwd-scoped — the TUI is a
         // cross-project dashboard; the CLI `ygg task ready` is the
@@ -342,9 +347,9 @@ impl DagView {
         // Without this fallback almost every task registers as unassigned
         // because `ygg task create` doesn't set an assignee, so the `a`
         // cycle was effectively dead.
-        let mut owner_ids: HashSet<Uuid> = HashSet::new();
+        let mut owner_ids: HashSet<String> = HashSet::new();
         for t in &unfiltered_open {
-            let owner = t.assignee.or(t.created_by);
+            let owner = t.assignee.clone().or(t.created_by.clone());
             if let Some(id) = owner {
                 owner_ids.insert(id);
             }
@@ -353,10 +358,10 @@ impl DagView {
             .list()
             .await
             .unwrap_or_default();
-        let mut assignees: Vec<(Uuid, String)> = all_agents
+        let mut assignees: Vec<(String, String)> = all_agents
             .into_iter()
             .filter(|a| owner_ids.contains(&a.agent_id))
-            .map(|a| (a.agent_id, a.agent_name))
+            .map(|a| (a.agent_id.clone(), a.agent_name))
             .collect();
         assignees.sort_by(|a, b| a.1.cmp(&b.1));
         self.known_assignees = assignees;
@@ -365,32 +370,33 @@ impl DagView {
         // descendants) and rendering (children badges). Do this BEFORE the
         // assignee/subtree filter so descendants are computed from the full
         // graph, not a post-filter subset.
-        let every_id: Vec<Uuid> = unfiltered_open.iter().map(|t| t.task_id).collect();
-        let edges_all: Vec<(Uuid, Uuid)> = sqlx::query_as::<_, (Uuid, Uuid)>(
+        let every_id: Vec<String> = unfiltered_open.iter().map(|t| t.task_id.clone()).collect();
+        let edges_all: Vec<(String, String)> = sqlx::query_as::<_, (String, String)>(
             "SELECT task_id, blocker_id FROM task_deps
-             WHERE task_id = ANY($1) OR blocker_id = ANY($1)",
+             WHERE task_id IN (SELECT value FROM json_each($1))
+                OR blocker_id IN (SELECT value FROM json_each($1))",
         )
-        .bind(&every_id)
+        .bind(serde_json::to_string(&every_id).unwrap_or_default())
         .fetch_all(pool)
         .await
         .unwrap_or_default();
 
         // Apply filters. Subtree focus comes first — it restricts the
         // universe of visible task_ids, then agent filter narrows further.
-        let mut allowed: Option<HashSet<Uuid>> = None;
-        if let Some(root) = self.subtree_focus {
-            let mut descendants: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+        let mut allowed: Option<HashSet<String>> = None;
+        if let Some(root) = self.subtree_focus.clone() {
+            let mut descendants: HashMap<String, Vec<String>> = HashMap::new();
             for (t, b) in &edges_all {
-                descendants.entry(*b).or_default().push(*t);
+                descendants.entry(b.clone()).or_default().push(t.clone());
             }
-            let mut keep: HashSet<Uuid> = HashSet::new();
+            let mut keep: HashSet<String> = HashSet::new();
             let mut frontier = vec![root];
             while let Some(id) = frontier.pop() {
-                if !keep.insert(id) {
+                if !keep.insert(id.clone()) {
                     continue;
                 }
                 if let Some(children) = descendants.get(&id) {
-                    frontier.extend(children.iter().copied());
+                    frontier.extend(children.iter().cloned());
                 }
             }
             allowed = Some(keep);
@@ -399,10 +405,10 @@ impl DagView {
         let all_open: Vec<Task> = unfiltered_open
             .into_iter()
             .filter(|t| {
-                let owner = t.assignee.or(t.created_by);
+                let owner = t.assignee.clone().or(t.created_by.clone());
                 match &self.agent_filter {
                     AgentFilter::All => true,
-                    AgentFilter::Specific(a) => owner == Some(*a),
+                    AgentFilter::Specific(a) => owner.as_ref() == Some(a),
                     AgentFilter::Unassigned => owner.is_none(),
                 }
             })
@@ -423,9 +429,9 @@ impl DagView {
         }
 
         // Bucket by repo.
-        let mut by_repo: HashMap<Uuid, Vec<Task>> = HashMap::new();
+        let mut by_repo: HashMap<String, Vec<Task>> = HashMap::new();
         for t in all_open {
-            by_repo.entry(t.repo_id).or_default().push(t);
+            by_repo.entry(t.repo_id.clone()).or_default().push(t);
         }
 
         // Build the forward/backward edge maps from the preloaded edges.
@@ -433,8 +439,14 @@ impl DagView {
         self.children_of.clear();
         self.blockers_of.clear();
         for (t, b) in &edges_all {
-            self.children_of.entry(*b).or_default().push(*t);
-            self.blockers_of.entry(*t).or_default().push(*b);
+            self.children_of
+                .entry(b.clone())
+                .or_default()
+                .push(t.clone());
+            self.blockers_of
+                .entry(t.clone())
+                .or_default()
+                .push(b.clone());
         }
         let children_of = &self.children_of;
         let blockers_of = &self.blockers_of;
@@ -448,7 +460,8 @@ impl DagView {
                     .find(|r| r.repo_id == t.repo_id)
                     .map(|r| r.task_prefix.clone())
                     .unwrap_or_default();
-                self.tasks_by_id.insert(t.task_id, (t.clone(), prefix));
+                self.tasks_by_id
+                    .insert(t.task_id.clone(), (t.clone(), prefix));
             }
         }
 
@@ -468,11 +481,12 @@ impl DagView {
                 open_count: tasks.len(),
             });
 
-            let by_id: BTreeMap<Uuid, &Task> = tasks.iter().map(|t| (t.task_id, t)).collect();
+            let by_id: BTreeMap<String, &Task> =
+                tasks.iter().map(|t| (t.task_id.clone(), t)).collect();
 
             // When a subtree is focused, only THAT task is a root in its
             // repo — everything else is either a descendant or filtered out.
-            let mut roots: Vec<&Task> = if let Some(focus) = self.subtree_focus {
+            let mut roots: Vec<&Task> = if let Some(focus) = self.subtree_focus.clone() {
                 tasks.iter().filter(|t| t.task_id == focus).collect()
             } else {
                 tasks
@@ -488,13 +502,13 @@ impl DagView {
             };
             sort_tasks(&mut roots, self.sort);
 
-            let mut visited: HashSet<Uuid> = HashSet::new();
+            let mut visited: HashSet<String> = HashSet::new();
             for r in &roots {
                 walk(
-                    r.task_id,
+                    r.task_id.clone(),
                     0,
                     &repo.task_prefix,
-                    &children_of,
+                    children_of,
                     &by_id,
                     &mut visited,
                     &mut rows,
@@ -512,7 +526,7 @@ impl DagView {
                         is_root: true,
                         n_children,
                     });
-                    visited.insert(t.task_id);
+                    visited.insert(t.task_id.clone());
                 }
             }
         }
@@ -727,10 +741,10 @@ impl DagView {
         frame.render_stateful_widget(list, chunks[1], &mut self.state);
 
         // Detail overlay floats over the full area.
-        if self.detail_open {
-            if let Some((task, prefix)) = self.selected_task() {
-                render_detail_overlay(frame, area, task, prefix);
-            }
+        if self.detail_open
+            && let Some((task, prefix)) = self.selected_task()
+        {
+            render_detail_overlay(frame, area, task, prefix);
         }
 
         // Inline-input overlay for 'n' (add child). Centered, small.
@@ -1018,23 +1032,23 @@ pub fn render_detail_overlay(frame: &mut Frame, area: Rect, task: &Task, prefix:
 }
 
 fn walk(
-    id: Uuid,
+    id: String,
     depth: usize,
     prefix: &str,
-    children_of: &HashMap<Uuid, Vec<Uuid>>,
-    by_id: &BTreeMap<Uuid, &Task>,
-    visited: &mut HashSet<Uuid>,
+    children_of: &HashMap<String, Vec<String>>,
+    by_id: &BTreeMap<String, &Task>,
+    visited: &mut HashSet<String>,
     rows: &mut Vec<RenderRow>,
     sort: DagSort,
 ) {
-    if !visited.insert(id) {
+    if !visited.insert(id.clone()) {
         return;
     }
     let Some(task) = by_id.get(&id).copied() else {
         return;
     };
     let children = children_of.get(&id).cloned().unwrap_or_default();
-    let n_children = children.iter().filter(|c| by_id.contains_key(c)).count();
+    let n_children = children.iter().filter(|c| by_id.contains_key(*c)).count();
 
     rows.push(RenderRow::Task {
         task: task.clone(),
@@ -1052,7 +1066,7 @@ fn walk(
 
     for child in sorted {
         walk(
-            child.task_id,
+            child.task_id.clone(),
             depth + 1,
             prefix,
             children_of,

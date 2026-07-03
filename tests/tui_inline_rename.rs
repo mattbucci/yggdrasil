@@ -21,7 +21,7 @@ fn rename_begin_with_no_selection_is_noop() {
 #[test]
 fn cancel_clears_buffer() {
     let mut v = TasksView::new();
-    v.rename = Some((uuid::Uuid::nil(), "edit".into()));
+    v.rename = Some((uuid::Uuid::nil().to_string(), "edit".into()));
     v.rename_cancel();
     assert!(!v.rename_mode());
 }
@@ -29,7 +29,7 @@ fn cancel_clears_buffer() {
 #[test]
 fn push_pop_round_trip() {
     let mut v = TasksView::new();
-    v.rename = Some((uuid::Uuid::nil(), "ab".into()));
+    v.rename = Some((uuid::Uuid::nil().to_string(), "ab".into()));
     v.rename_push('c');
     assert_eq!(v.rename_buffer(), Some("abc"));
     v.rename_pop();
